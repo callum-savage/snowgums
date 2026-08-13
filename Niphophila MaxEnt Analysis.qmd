@@ -1,0 +1,339 @@
+---
+title: "Snowgums MaxEnt Analysis"
+author: "Callum Savage"
+format: html
+editor: visual
+---
+
+Hi Tessa!
+
+## Introduction
+
+The aim of this notebook is to use MaxEnt to estimate how climate change will impact the habitat of *Eucalyptus pauciflora subsp. niphopila* for use in an ECBA submission.
+
+The specific criteria being addressed is:
+
+> *2b) **Continuing decline** observed, estimated, inferred or **projected** in any of: (i) extent of occurrence; (ii) area of occupancy; **(iii) area, extent and/or quality of habitat;** (iv) number of locations or subpopulations; (v) number of mature individuals."*
+
+### Steps
+
+- [x] Download and import occurrence data
+
+- [x] Define the study area
+
+- [x] Spatial thinning of occurrence data
+
+- [x] Download and import climate predictors (present)
+
+- [x] Remove highly collinear predictors
+
+- [ ] Fit the current-climate MaxEnt model
+
+- [ ] Evaluate the model
+
+- [ ] Download and import future climate projections
+
+- [ ] Project the fitted model onto each future time step
+
+- [ ] Quantify habitat change over time
+
+- [ ] Sensitivity/uncertainty analysis
+
+- [ ] Maps and summary statistics
+
+## Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+library(dplyr)   # Data wrangiling
+library(sf)      # Vector data
+library(terra)   # Raster data
+library(mapview) # Quick interactive maps
+library(galah)   # Access species occurence data (Atlas of Living Australia)
+
+# An email (attached to an account) is required for galah requiests
+galah_config(
+  email = "callum.savage@student.unimelb.edu.au",
+  caching = TRUE,
+  directory = here::here("data/galah")
+)
+
+# Set the default mapview appearance
+mapviewOptions(
+  basemaps = c("Esri.WorldImagery", "Esri.WorldTopoMap", "Esri.NatGeoWorldMap"),
+  legend = FALSE
+)
+
+# Set a seed for reporducible random number generation
+set.seed(4444)
+```
+
+## Download the occurrence data
+
+The first thing I'll do is import the *E. niphophila* observational data, filtering out low-quality observations and outliers.
+
+```{r}
+# Download presence data from the Atalas of Living Australia
+# This data download generates a doi for reproducibility
+
+niph_occurences_path <- here::here("data/galah/niph_occurences.rds")
+
+if (file.exists(niph_occurences_path)) {
+  niph_occurences <- readr::read_rds(niph_occurences_path)
+} else {
+  niph_occurences <- galah_call() |>
+    identify("Eucalyptus pauciflora subsp. niphophila") |>
+    apply_profile(CSDM) |> # Built-in quality filter for species distribution modelling
+    filter(country == "Australia", stateProvince != "Tasmania") |>
+    select(
+      group = "basic",
+      basisOfRecord,
+      institutionCode,
+      coordinateUncertaintyInMeters,
+      locality,
+      identifiedBy
+    ) |>
+    atlas_occurrences(mint_doi = TRUE, file = "niph_occurences.zip")
+  
+  readr::write_rds(niph_occurences, niph_occurences_path)
+}
+
+# Filter out additional low-quality observations
+niph_filtered <- niph_occurences |> 
+  filter(!is.na(decimalLongitude), !is.na(decimalLatitude)) |> 
+  filter(decimalLongitude > 145) |> 
+  filter(!is.na(eventDate)) |> 
+  filter(!is.na(coordinateUncertaintyInMeters)) |> 
+  filter(coordinateUncertaintyInMeters <= 1000)
+
+# Convert the tibble to an sf object
+niph <- niph_filtered |> 
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+mapview(niph)
+```
+
+## Filter out low-quality observations
+
+As an additional data quality check I'm going to look up the elevation of each point.
+
+```{r}
+# Download a 5 degree tile of 3s elevation data which covers the observations
+# NOTE: Double check the CRS here
+
+elev_3s <- geodata::elevation_3s(lon = 147.5, lat = -37.5, path = here::here("data"))
+
+# Extract the elevation at each observation, and filter out records below 1300 m
+
+niph_elev <- niph |> 
+  mutate(elev = terra::extract(elev_3s, vect(st_transform(niph, crs(elev_3s))))[, 2]) |> 
+  filter(elev > 1300) # This needs refining. Matt Brookhouse uses 1600 for Remote Sensing analysis
+```
+
+## Notes:
+
+- The CDSM filter of records might be a bit aggressive, so there are probably more records we can use. I'm also not really sure what rationale it's using to filter out records.
+
+- Should there be a date cut-off for observations? Some of them are 50+ years old which isn't exactly present conditions.
+
+- I should also look at the location uncertainty for each observation - DONE
+
+- There are some weird horizontal lines of records in NSW. I think they might be transects, but they could also be observations with rounded latitude. it's probably worth checking. And even if they are transects, they may still be skewing the results.
+
+- I'm not sure about filtering out records below 1300m. It removes some clear data quality issues, but it's probably a bit simplistic.
+
+- Data points can also be excluded based on known range - i.e. niphophila unlikely to be on Baw Baw
+
+## Define the study area
+
+We can define a plausible habitat area using a combination of the Australian Alps bioregion and elevation data.
+
+```{r}
+# Import IBRA Bioregions Version 7.1, and select the Australian Alps bioregion
+# https://fed.dcceew.gov.au/datasets/erin::interim-biogeographic-regionalisation-for-australia-ibra-version-7-1-regions/about
+# Note: This data does not download automatically
+aus_alps <- st_read(here::here("data/IBRA7_regions.gdb")) |>
+  filter(REG_NAME_7 == "Australian Alps") |> 
+  st_transform(4326) |> 
+  st_union()
+
+# Download 30s elevation data for Australia - tiles match the climate variables
+elev_30s <- geodata::elevation_30s(
+  country = "AUS",
+  path = here::here("data")
+)
+
+elev_30s_crop <- crop(elev_30s, vect(aus_alps), mask = TRUE)
+elev_mask <- elev_30s_crop >= 1300
+
+study_area <- elev_mask |> 
+  as.polygons() |>  # convert TRUE/FALSE raster mask to vector polygons
+  st_as_sf() |> 
+  filter(AUS_elv_msk == 1) |>  # keep only cells above threshold (check actual layer name)
+  st_union() |> 
+  st_transform(4326)
+
+# Simplify the study area
+# study_area2 <- study_area |> 
+#   drop_crumbs(threshold = set_units(2, km^2)) |> 
+#   fill_holes(threshold = set_units(2, km^2)) |> 
+#   smooth(method = "ksmooth", smoothness = 3)
+
+mapview(study_area, alpha.regions = 0.5, lwd = 2, alpha = 1) +
+  mapview(niph_elev, col.regions = "purple")
+
+# This study area is very jagged. Maybe I should just be using the bioregion? Also, there are still some points which sit outside of this region
+```
+
+```{r}
+
+# Define the study area around the occurence data using a buffered convex hull
+# This is basically like putting a rubber band around the observations, plus a 20 km buffer
+# 
+# study_area <- niph |>
+#   st_transform(3577) |> # GDA94 / Australian Albers (metres)
+#   st_union() |>
+#   st_convex_hull() |>
+#   st_buffer(dist = 20000) |> # 20 km
+#   st_transform(4326)
+
+# niph_dist |> 
+#   mutate(elevation_m = terra::extract(
+#     elev_tile, 
+#     vect(st_transform(niph_dist, crs(elev_tile)))
+#   )[, 2]) |> 
+#   st_drop_geometry() |> 
+#   select(locality, dist_to_bioregion_km, elevation_m, coordinateUncertaintyInMeters, basisOfRecord) |> 
+#   filter(dist_to_bioregion_km > 0) |> 
+#   dput()
+```
+
+## Spatial thinning
+
+```{r}
+# thin() wants plain lon/lat columns, not an sf geometry column
+niph_coords <- niph_elev |> 
+  st_transform(4326) |> 
+  mutate(
+    Longitude = st_coordinates(geometry)[, 1],
+    Latitude = st_coordinates(geometry)[, 2],
+    species = "niphophila" # spec.col is required even for a single species
+  ) |> 
+  st_drop_geometry()
+
+thinned <- spThin::thin(
+  loc.data = niph_coords,
+  lat.col = "Latitude",
+  long.col = "Longitude",
+  spec.col = "species",
+  thin.par = 1, # Thinning distance 1 km, should be similar to cell size
+  reps = 100,
+  locs.thinned.list.return = TRUE,
+  write.files = FALSE,
+  write.log.file = FALSE
+)
+
+# Keep the dataframe with the most retained records
+best_rep <- thinned[[which.max(sapply(thinned, nrow))]]
+
+# Re-join back to the full occurrence data to recover all original columns
+niph_thinned <- niph_coords |> 
+  semi_join(best_rep, by = c("Longitude", "Latitude")) |> 
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+
+mapview(niph_thinned)
+```
+
+## Download climate data
+
+We can download climate data from [WorldClim](https://www.worldclim.org/) at 30 second resolution (\~1 km² grid cells).
+
+```{r}
+# WorldClim climate data is stored as 30x30 degree tiles. 
+# We only need one tile to cover the study area
+clim_tile <- geodata::worldclim_tile(
+  var = "bio",
+  res = "0.5", # 0.5 minute resolution
+  lon = 135,
+  lat = -45,
+  path = here::here("data")
+)
+
+# Crop the climate data to our study area
+clim <- crop(clim_tile, vect(study_area), mask = TRUE)
+
+# Create a key for interpreting the layer names
+bioclim_names <- c(
+  bio_1  = "Annual Mean Temperature",
+  bio_2  = "Mean Diurnal Range",
+  bio_3  = "Isothermality",
+  bio_4  = "Temperature Seasonality",
+  bio_5  = "Max Temperature of Warmest Month",
+  bio_6  = "Min Temperature of Coldest Month",
+  bio_7  = "Temperature Annual Range",
+  bio_8  = "Mean Temperature of Wettest Quarter",
+  bio_9  = "Mean Temperature of Driest Quarter",
+  bio_10 = "Mean Temperature of Warmest Quarter",
+  bio_11 = "Mean Temperature of Coldest Quarter",
+  bio_12 = "Annual Precipitation",
+  bio_13 = "Precipitation of Wettest Month",
+  bio_14 = "Precipitation of Driest Month",
+  bio_15 = "Precipitation Seasonality",
+  bio_16 = "Precipitation of Wettest Quarter",
+  bio_17 = "Precipitation of Driest Quarter",
+  bio_18 = "Precipitation of Warmest Quarter",
+  bio_19 = "Precipitation of Coldest Quarter"
+)
+
+# Plot the first variable - annual mean temperature
+mapview(clim$bio_1)
+```
+
+## Select predictor variables
+
+Many of these predictor variables are highly co-linear (e.g. Precipitation of Wettest Month and Precipitation of Wettest Quater), and including all of them can cause model instability and make it difficult to assess the importance of each variable.
+
+```{r}
+# Generate random background points across the study area
+bg_points <- st_sample(study_area, size = 10000, type = "random")
+
+# Extract climate values at these points
+clim_vals <- terra::extract(clim, vect(bg_points), ID = FALSE) |> 
+  na.omit()
+
+# Calculate a correlation matrix of the variables across our study area
+cor_matrix <- cor(clim_vals, method = "pearson")
+
+# For visual inspection of correlations
+corrplot::corrplot(cor_matrix, method = "circle", type = "upper")
+```
+
+We can use the Variance Inflation Factor (VIF) to remove highly correlated predictors.
+
+```{r}
+# Remove the four 'interactive' variables which are related to both temperature 
+# and precipitation. These variables can have biologically meaningless discontinuities due to
+# variation in which quarter counts as wettest or warmest.
+
+interactive_vars <- c("bio_8", "bio_9", "bio_18", "bio_19")
+
+clim_candidates <- clim[[setdiff(names(clim), interactive_vars)]]
+
+# Iteratively remove highly correlated variables using VIF
+# th = 10 is a common threshold; th = 5 is stricter
+v <- usdm::vifstep(clim_candidates, th = 10, keep = "bio_6") 
+
+clim_selected <- usdm::exclude(clim_candidates, v)
+
+v
+```
+
+### Notes
+
+- The decision to use 10,000 background points is totally arbitrary and should probably be justified
+
+- The correlation between two variables being over 0.7 is still quite high
+
+\
