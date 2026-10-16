@@ -45,6 +45,7 @@ library(ggplot2)   # Plotting
 
 # An email (attached to an account) is required for galah requiests
 # If you're adapting this code please don't use my email
+
 galah_config(
   email = "callum.savage@student.unimelb.edu.au",
   caching = TRUE,
@@ -52,12 +53,14 @@ galah_config(
 )
 
 # Set some default mapview parameters
+
 mapviewOptions(
   basemaps = c("Esri.WorldImagery", "Esri.WorldTopoMap", "Esri.NatGeoWorldMap"),
   legend = FALSE
 )
 
 # Choose a random number seed so results are reproducible
+
 set.seed(4444)
 ```
 
@@ -84,6 +87,7 @@ if (file.exists(niph_raw_path)) {
 } else {
   
   # Construct an API call to galah
+  
   niph_raw_call <- galah_call() |>
     identify("Eucalyptus pauciflora subsp. niphophila") |>
     select(
@@ -99,13 +103,18 @@ if (file.exists(niph_raw_path)) {
       "outlierLayerCount",
       "year",
       "country",
-      "stateProvince"
+      "stateProvince",
+      "identifiedBy",
+      "locality",
+      "institutionCode"
     )
   
   # Download our occurrence data
+  
   niph_raw <- atlas_occurrences(niph_raw_call)
   
   # Save the raw data as an rds file
+  
   write_rds(niph_raw, niph_raw_path)
 }
 
@@ -143,23 +152,42 @@ niph_raw_filtered <- niph_raw |>
     stateProvince %in% c("Victoria", "Australian Capital Territory", "New South Wales")
   )
 
-nrow(niph_raw_filtered)
+# Select a useful subset of columns to use in the rest of the analysis
+
+niph_filtered <- niph_raw_filtered |>
+  select(
+    "recordID",
+    "scientificName",
+    "decimalLongitude",
+    "decimalLatitude",
+    "coordinateUncertaintyInMeters",
+    "eventDate",
+    "year",
+    "basisOfRecord",
+    "identifiedBy",
+    "locality",
+    "stateProvince",
+    "dataResourceName",
+    "institutionCode"
+  )
+
+# Convert the observations into a spatial object
+
+niph_filtered_sf <- st_as_sf(
+  niph_filtered, 
+  coords = c("decimalLongitude", "decimalLatitude"), 
+  crs = 4326
+)
+
+mapview(niph_raw_filtered_sf)
 ```
 
-## Targeted outlier removal
+### Targeted outlier removal
 
-Let's see how our filtered data looks on a map.
-
-```{r}
-niph_raw_filtered |> 
-  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326) |> 
-  mapview()
-```
-
-Some observations are still suspicious.
+Some observations are still suspicious, despite passing the data quality checks. I'll remove these records explicitly.
 
 +--------------------------------------+-----------------------------------------------------------------------------------------+
-| **recordID**                         | Reason for removal                                                                      |
+| **recordID**                         | **Reason for removal**                                                                  |
 +======================================+=========================================================================================+
 | 2c4dd780-74ef-4337-893b-250e47aa64a8 | In Grampians NP, well outside known range                                               |
 +--------------------------------------+-----------------------------------------------------------------------------------------+
@@ -167,24 +195,107 @@ Some observations are still suspicious.
 |                                      |                                                                                         |
 | 56c4cb9d-db98-4f0c-8080-d75a281a5b06 |                                                                                         |
 +--------------------------------------+-----------------------------------------------------------------------------------------+
-|                                      |                                                                                         |
-+--------------------------------------+-----------------------------------------------------------------------------------------+
-
-Filter out low-quality observations
-
-As an additional data quality check I'm going to look up the elevation of each point.
 
 ```{r}
-# Download a 5 degree tile of 3s elevation data which covers the observations
-# NOTE: Double check the CRS here
+suspicious_records <- c(
+  "2c4dd780-74ef-4337-893b-250e47aa64a8",
+  "f1047be9-66f7-4ba6-9157-d0f1d906fa12",
+  "56c4cb9d-db98-4f0c-8080-d75a281a5b06"
+)
+
+niph_notsus_sf <- niph_filtered_sf |> 
+  filter(
+    recordID %notin% suspicious_records
+  )
+
+mapview(filter(niph_filtered_sf, recordID %in% suspicious_records))
+```
+
+### Check the elevations
+
+*Niphophila* is known to inhabit altitudes above 1600 m. To allow for some natural variation we'll allow records down to 1400 m, but any records below this altitude will be removed.
+
+```{r}
+# Download a 5 degree tile of 3s elevation data which covers the observations.
+# 3s data is on a grid of around 90 m x 90 m, which is more accurate than most of our data.
+# The crs is EPSG:4326
 
 elev_3s <- geodata::elevation_3s(lon = 147.5, lat = -37.5, path = here::here("data"))
 
-# Extract the elevation at each observation, and filter out records below 1300 m
+# Convert our observations to SpatVector for terra
 
-niph_elev <- niph |> 
-  mutate(elev = terra::extract(elev_3s, vect(st_transform(niph, crs(elev_3s))))[, 2]) |> 
-  filter(elev > 1300) # This needs refining. Matt Brookhouse uses 1600 for Remote Sensing analysis
+niph_vect <- vect(niph_notsus_sf)
+
+# Extract the elevation at each point
+
+niph_elevs <- extract(elev_3s, niph_vect)
+
+# Construct a buffer around each observation to account for positional uncertainty
+
+niph_buffers <- buffer(
+  niph_vect, 
+  width = niph_notsus_sf$coordinateUncertaintyInMeters
+)
+
+# Extract the maximum and minimum elevations in each buffer zone
+
+niph_elev_ranges <- extract(elev_3s, niph_buffers, fun = range, na.rm = TRUE)
+
+# Join the extracted elevation data back to our raw data set
+
+niph_elev_sf <- niph_notsus_sf |>
+  mutate(
+    elevation_m = niph_elevs[[2]],
+    elevation_m_min = niph_elev_ranges[, 2],
+    elevation_m_max = niph_elev_ranges[, 3]
+  )
+
+# Filter out records below 1400 m
+
+niph_elev_filter_sf <- niph_elev_sf |> 
+  filter(elevation_m >= 1400)
+
+# Have a look at observations at an eleveation below 1400 m
+
+niph_elev_sf |> 
+  mutate(below_alt = elevation_m < 1400) |> 
+  mapview(zcol = "below_alt")
+```
+
+### Australian Alps bioregion
+
+The Australian Alps bioregion will be key in defining our study area. I'll also use it to exclude any final records which might not be where we expect to find *Niphophila*.
+
+```{r}
+# The bioregions geodatabase doesn't download automatically. If needed, download it from
+# https://fed.dcceew.gov.au/datasets/interim-biogeographic-regionalisation-for-australia-ibra-version-7-1-regions/about
+
+# Import the Australian Alps bioregion polygon
+
+aus_alps <- st_read(here::here("data/IBRA7_regions.gdb")) |>
+  filter(REG_NAME_7 == "Australian Alps") |> 
+  st_transform(4326) |> 
+  st_union()
+
+# Identify any observations outside the bioregion
+
+niph_outside_aus_alps <- niph_elev_filter_sf |> 
+  st_filter(aus_alps, .predicate = st_disjoint)
+
+# Plot just the points outside the bioregion
+
+mapview(aus_alps, alpha.regions = 0.5, lwd = 2, alpha = 1) +
+  mapview(niph_outside_aus_alps, col.regions = "red")
+```
+
+There are three observations outside the bioregion. They're all clustered around Thredbo and only a few hundred metres outside the region. As they're so close to the bioregion I'm inclined to keep them in the data set - the positional uncertainty in both the point data and the bioregion definition mean that excluding them would be arbitrary.
+
+This means we now have our final observations data set.
+
+```{r}
+niph <- niph_1400_sf
+
+niph
 ```
 
 ## Notes:
@@ -207,7 +318,7 @@ We can define a plausible habitat area using a combination of the Australian Alp
 
 ```{r}
 # Import IBRA Bioregions Version 7.1, and select the Australian Alps bioregion
-# https://fed.dcceew.gov.au/datasets/erin::interim-biogeographic-regionalisation-for-australia-ibra-version-7-1-regions/about
+# https://fed.dcceew.gov.au/datasets/interim-biogeographic-regionalisation-for-australia-ibra-version-7-1-regions/about
 # Note: This data does not download automatically
 aus_alps <- st_read(here::here("data/IBRA7_regions.gdb")) |>
   filter(REG_NAME_7 == "Australian Alps") |> 
