@@ -13,7 +13,16 @@ The specific criteria being addressed is:
 
 > *2b) **Continuing decline** observed, estimated, inferred or **projected** in any of: (i) extent of occurrence; (ii) area of occupancy; **(iii) area, extent and/or quality of habitat;** (iv) number of locations or subpopulations; (v) number of mature individuals."*
 
-That is: we're trying to quantify the decline in the area of *niphophila* habitat under future climate change projections.
+That is, we're trying to quantify the decline in the area of *niphophila* habitat under future climate change projections.
+
+## Some similar analyses
+
+- Ren, Jun, Suhang Li, Yawen Zhang, Qiong Yang, Jiaojiao Liu, Jing Fan, and Yangzhou Xiang. 2025. ‘MaxEnt-Based Evaluation of Climate Change Effects on the Habitat Suitability of Magnolia Officinalis in China’. *Frontiers in Plant Science* 16:1601585. doi:[10.3389/fpls.2025.1601585](https://doi.org/10.3389/fpls.2025.1601585).
+
+## Useful references for MaxEnt modeling:
+
+- Merow, C., Smith, M. J., & Silander, J. A. (2013). A practical guide to MaxEnt for modeling species’ distributions: What it does, and why inputs and settings matter. Ecography, 36(10), 1058–1069. https://doi.org/10.1111/j.1600-0587.2013.07872.x
+- Elith, J., Phillips, S. J., Hastie, T., Dudík, M., Chee, Y. E., & Yates, C. J. (2011). A statistical explanation of MaxEnt for ecologists: Statistical explanation of MaxEnt. Diversity and Distributions, 17(1), 43–57. https://doi.org/10.1111/j.1472-4642.2010.00725.x
 
 ## Setup
 
@@ -23,15 +32,15 @@ This section just contains package imports and configurations.
 #| message: false
 #| warning: false
 
-library(dplyr)   # Data wrangiling
-library(purrr)   # Functional programming tools
-library(sf)      # Vector data tools
-library(terra)   # Raster data tools
-library(mapview) # Quick interactive maps
-library(galah)   # Access species occurence data (Atlas of Living Australia)
-library(maxnet)  # Maxent species distribution modeling
-library(ENMeval) # Tune echological niche models
-library(ggplot2) # Plotting
+library(dplyr)     # Data wrangiling
+library(purrr)     # Functional programming tools
+library(sf)        # Vector data tools
+library(terra)     # Raster data tools
+library(mapview)   # Quick interactive maps
+library(galah)     # Access species occurence data (Atlas of Living Australia)
+library(maxnet)    # Maxent species distribution modeling
+library(ENMeval)   # Tune echological niche models
+library(ggplot2)   # Plotting
 
 # An email (attached to an account) is required for galah requiests
 # If you're adapting this code please don't use my email
@@ -41,13 +50,13 @@ galah_config(
   directory = here::here("data/galah")
 )
 
-# Set the default mapview appearance
+# Set some default mapview parameters
 mapviewOptions(
   basemaps = c("Esri.WorldImagery", "Esri.WorldTopoMap", "Esri.NatGeoWorldMap"),
   legend = FALSE
 )
 
-# Set a seed for reporducible random number generation
+# Choose a random number seed so results are reproducible
 set.seed(4444)
 ```
 
@@ -55,46 +64,79 @@ set.seed(4444)
 
 The first thing I'll do is import the *E. niphophila* observational data, filtering out low-quality observations and outliers.
 
-I'm using the `galah` package to access observations, which compiles data from a number of different sources including the Atlas of Living Australia. Not all of this data is super high quality, but there's a built in data quality filter designed for species distribution modelling which removes records that...
+I'm using the `galah` package to access observations, which compiles data from a number of different sources including the Atlas of Living Australia. Not all of this data is super high quality, but I'm applying some data quality filters to try and select only high-quality records.
 
-I'm doing a bit of extra da
+The most important data quality filters are
+
+- [`spatiallyValid`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/spatiallyValid)`== TRUE`: Built-in checks to make sure the coordinates are logically consistent
+
+- `is.na(isDuplicateOf)`: The record hasn't been flagged as a duplicate
+
+- [`outlierLayerCount`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/outlierLayerCount)`== 0`: The record isn't an outlier when compared with other environmental data.
+
+- [`coordinateUncertaintyInMeters`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/coordinate_uncertainty)`<= 1000`: Estimated coordinate uncertainty is less than 1 km. Records with no uncertainty estimate are removed as well.
+
+- I'm also removing records from before 1970, or which aren't in NSW, ACT, or Victoria.
 
 ```{r}
-# Download presence data from the Atalas of Living Australia
-# This data download generates a doi for reproducibility
-
 niph_occurences_path <- here::here("data/galah/niph_occurences.rds")
+
+# If niph_occurences has already been downloaded, import it. 
+# Otherwise, download observations from the Atlas of Living Australia. This data 
+# download generates a doi for reproducibility
 
 if (file.exists(niph_occurences_path)) {
   niph_occurences <- readr::read_rds(niph_occurences_path)
 } else {
+  
+  niph_cols <- c(
+    "recordID", 
+    "scientificName", 
+    "decimalLatitude", 
+    "decimalLongitude", 
+    "coordinateUncertaintyInMeters",
+    "eventDate", 
+    "year",
+    "basisOfRecord", 
+    "identifiedBy",
+    "locality",
+    "stateProvince",
+    "dataResourceName", 
+    "institutionCode"
+  )
+  
   niph_occurences <- galah_call() |>
     identify("Eucalyptus pauciflora subsp. niphophila") |>
-    apply_profile(CSDM) |> # Built-in quality filter for species distribution modelling
-    filter(country == "Australia", stateProvince != "Tasmania") |>
-    select(
-      group = "basic",
-      basisOfRecord,
-      institutionCode,
-      coordinateUncertaintyInMeters,
-      locality,
-      identifiedBy
+    filter(
+      occurrenceStatus == "PRESENT",
+      !is.na(decimalLongitude), 
+      !is.na(decimalLatitude),
+      coordinateUncertaintyInMeters <= 1000,
+      spatiallyValid == TRUE,
+      is.na(isDuplicateOf),
+      outlierLayerCount == 0,
+      year >= 1970,
+      country == "Australia",
+      stateProvince != "Tasmania"
     ) |>
-    atlas_occurrences(mint_doi = TRUE, file = "niph_occurences.zip")
+    select(all_of(niph_cols)) |>
+    atlas_occurrences(
+      mint_doi = TRUE,
+      file = "niph_occurences.zip"
+    )
   
   readr::write_rds(niph_occurences, niph_occurences_path)
 }
 
-# Filter out additional low-quality observations
-niph_filtered <- niph_occurences |> 
-  filter(!is.na(decimalLongitude), !is.na(decimalLatitude)) |> 
-  filter(decimalLongitude > 145) |> 
-  filter(!is.na(eventDate)) |> 
-  filter(!is.na(coordinateUncertaintyInMeters)) |> 
-  filter(coordinateUncertaintyInMeters <= 1000)
+niph_occurences
+```
 
-# Convert the tibble to an sf object
-niph <- niph_filtered |> 
+## Targeted data quality checks
+
+Let's convert our data to a spatial object and see how it looks on a map.
+
+```{r}
+niph <- niph_occurences |> 
   st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
 
 mapview(niph)
