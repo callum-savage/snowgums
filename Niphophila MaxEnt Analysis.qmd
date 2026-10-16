@@ -136,11 +136,13 @@ niph_occurences
 Let's convert our data to a spatial object and see how it looks on a map.
 
 ```{r}
-niph <- niph_occurences |> 
+niph_occurences_sf <- niph_occurences |> 
   st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
 
-mapview(niph)
+mapview(niph_occurences_sf)
 ```
+
+Some observations are still suspicious.
 
 ## Filter out low-quality observations
 
