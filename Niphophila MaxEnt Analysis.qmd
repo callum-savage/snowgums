@@ -5,55 +5,36 @@ format: html
 editor: visual
 ---
 
-Hi Tessa!
-
 ## Introduction
 
-The aim of this notebook is to use MaxEnt to estimate how climate change will impact the habitat of *Eucalyptus pauciflora subsp. niphopila* for use in an ECBA submission.
+The aim of this notebook is to use MaxEnt to estimate how climate change will impact the habitat of *Eucalyptus pauciflora subsp. niphophila* for use in an ECBA submission.
 
 The specific criteria being addressed is:
 
 > *2b) **Continuing decline** observed, estimated, inferred or **projected** in any of: (i) extent of occurrence; (ii) area of occupancy; **(iii) area, extent and/or quality of habitat;** (iv) number of locations or subpopulations; (v) number of mature individuals."*
 
-### Steps
-
-- [x] Download and import occurrence data
-
-- [x] Define the study area
-
-- [x] Spatial thinning of occurrence data
-
-- [x] Download and import climate predictors (present)
-
-- [x] Remove highly collinear predictors
-
-- [ ] Fit the current-climate MaxEnt model
-
-- [ ] Evaluate the model
-
-- [ ] Download and import future climate projections
-
-- [ ] Project the fitted model onto each future time step
-
-- [ ] Quantify habitat change over time
-
-- [ ] Sensitivity/uncertainty analysis
-
-- [ ] Maps and summary statistics
+That is: we're trying to quantify the decline in the area of *niphophila* habitat under future climate change projections.
 
 ## Setup
+
+This section just contains package imports and configurations.
 
 ```{r}
 #| message: false
 #| warning: false
 
 library(dplyr)   # Data wrangiling
-library(sf)      # Vector data
-library(terra)   # Raster data
+library(purrr)   # Functional programming tools
+library(sf)      # Vector data tools
+library(terra)   # Raster data tools
 library(mapview) # Quick interactive maps
 library(galah)   # Access species occurence data (Atlas of Living Australia)
+library(maxnet)  # Maxent species distribution modeling
+library(ENMeval) # Tune echological niche models
+library(ggplot2) # Plotting
 
 # An email (attached to an account) is required for galah requiests
+# If you're adapting this code please don't use my email
 galah_config(
   email = "callum.savage@student.unimelb.edu.au",
   caching = TRUE,
@@ -73,6 +54,10 @@ set.seed(4444)
 ## Download the occurrence data
 
 The first thing I'll do is import the *E. niphophila* observational data, filtering out low-quality observations and outliers.
+
+I'm using the `galah` package to access observations, which compiles data from a number of different sources including the Atlas of Living Australia. Not all of this data is super high quality, but there's a built in data quality filter designed for species distribution modelling which removes records that...
+
+I'm doing a bit of extra da
 
 ```{r}
 # Download presence data from the Atalas of Living Australia
@@ -336,4 +321,256 @@ v
 
 - The correlation between two variables being over 0.7 is still quite high
 
-\
+## Fit the current-climate model
+
+We can use `ENMeval` to tune the model's feature classes and regularisation multiplier via spatial cross-validation, rather than picking these settings arbitrarily.
+
+```{r}
+# ENMevaluate() wants plain coordinate data frames, not sf objects
+occs <- niph_thinned |>
+  st_coordinates() |>
+  as.data.frame() |>
+  rename(longitude = X, latitude = Y)
+
+bg <- bg_points |>
+  st_coordinates() |>
+  as.data.frame() |>
+  rename(longitude = X, latitude = Y)
+
+# ENMevaluate() is slow to re-run every time, so cache the result. Delete the
+# cache file (or the object below) to force a re-run after upstream changes
+# (e.g. to occs, bg, clim_selected, or the tuning settings)
+enmeval_results_path <- here::here("data/enmeval_results.rds")
+
+if (file.exists(enmeval_results_path)) {
+  enmeval_results <- readr::read_rds(enmeval_results_path)
+} else {
+  # Tune feature classes (L = linear, Q = quadratic, H = hinge, P = product) and
+  # regularisation multiplier, using spatial block partitioning - appropriate
+  # here since occurrences are geographically clustered rather than independent
+  enmeval_results <- ENMevaluate(
+    occs = occs,
+    envs = clim_selected,
+    bg = bg,
+    tune.args = list(fc = c("L", "LQ", "LQH", "LQHP"), rm = seq(0.5, 4, 0.5)),
+    partitions = "block",
+    algorithm = "maxnet"
+  )
+
+  readr::write_rds(enmeval_results, enmeval_results_path)
+}
+
+# Inspect tuning results, ranked by AICc (lower = better fit/complexity trade-off)
+enmeval_results@results |>
+  arrange(AICc)
+```
+
+```{r}
+# Select the best-supported settings (lowest AICc) and pull out that model
+best_settings <- enmeval_results@results |>
+  filter(delta.AICc == 0)
+
+maxent_model <- eval.models(enmeval_results)[[best_settings$tune.args]]
+
+# Project habitat suitability across the study area on the cloglog
+# (0-1, probability-like) scale
+suitability <- terra::predict(clim_selected, maxent_model, type = "cloglog", na.rm = TRUE)
+
+mapview(suitability) +
+  mapview(niph_thinned, col.regions = "purple", cex = 3)
+```
+
+### Notes
+
+- Feature class/regularisation multiplier combinations are chosen by lowest AICc - worth sanity-checking against cross-validated AUC and omission rate too, both in `enmeval_results@results`
+
+- Block partitioning splits occurrences into 4 spatial folds by default - given how clustered/narrow-ranged this species is, worth checking the fold sizes are reasonable (`enmeval_results@occs.grp`)
+
+## Evaluate the model
+
+```{r}
+# Cross-validated performance of the selected feature class / regularisation
+# multiplier, from the spatial block cross-validation done during tuning
+best_settings |>
+  select(fc, rm, auc.val.avg, auc.val.sd, or.10p.avg, or.mtp.avg, AICc)
+```
+
+To use this model for quantifying habitat area, we need to convert the continuous suitability surface into a binary suitable/unsuitable classification. We'll use the threshold that maximises the sum of sensitivity and specificity (maxSSS) across the training presence and background points, which tends to be a more robust choice than a fixed percentile threshold (Liu et al. 2013).
+
+```{r}
+# Predicted suitability at presence and background locations
+# (na.omit drops any points falling on NA cells at the study area's edge)
+pred_occs_raw <- terra::extract(suitability, vect(niph_thinned), ID = FALSE)[[1]]
+pred_bg_raw <- terra::extract(suitability, vect(bg_points), ID = FALSE)[[1]]
+
+pred_occs <- na.omit(pred_occs_raw)
+pred_bg <- na.omit(pred_bg_raw)
+
+# Flag how many points fell outside the study area mask (see earlier note on
+# occurrences sitting outside the study area)
+message(sum(is.na(pred_occs_raw)), " of ", length(pred_occs_raw), " presence points dropped (NA cell)")
+message(sum(is.na(pred_bg_raw)), " of ", length(pred_bg_raw), " background points dropped (NA cell)")
+
+# Find the threshold maximising sensitivity + specificity
+candidate_thresholds <- seq(0, 1, by = 0.001)
+tss <- sapply(candidate_thresholds, function(t) {
+  sensitivity <- mean(pred_occs >= t)
+  specificity <- mean(pred_bg < t)
+  sensitivity + specificity - 1
+})
+
+suitability_threshold <- candidate_thresholds[which.max(tss)]
+suitability_threshold
+```
+
+```{r}
+# Binary suitable/unsuitable habitat map at that threshold
+suitable_habitat <- suitability >= suitability_threshold
+
+mapview(suitable_habitat) +
+  mapview(niph_thinned, col.regions = "purple", cex = 3)
+```
+
+### Notes
+
+- `or.10p.avg`/`or.mtp.avg` are cross-validated omission rates (10th percentile and minimum training presence) - worth checking these are reasonably low for the selected settings, not just the AICc ranking
+
+- `suitability_threshold` will be reused later to quantify suitable habitat area under current and future climate
+
+## Download future climate projections
+
+We can download future climate projections from WorldClim's CMIP6 downscaled data. As with the current-climate data, we use `cmip6_tile()` rather than `cmip6_world()` so we only download the one 30x30 degree tile covering our study area, rather than a global raster (`cmip6_world()` has no `lon`/`lat` argument - it always fetches the full-extent global GeoTIFF, \~1-6+ GB per GCM/SSP/time combination, which isn't practical here).
+
+Rather than a single climate model, we use a spread of GCMs (Global Climate Models) so we can later assess how much projected habitat change depends on the choice of model. We also use all four SSPs (emissions scenarios) available in WorldClim's CMIP6 data, and three time periods spanning short- to long-term projections.
+
+```{r}
+# GCMs chosen to span a range of climate sensitivity (cooler to hotter projections)
+future_gcms <- c("MIROC6", "MPI-ESM1-2-HR", "IPSL-CM6A-LR", "ACCESS-CM2")
+
+# All four SSPs (emissions scenarios) available from WorldClim's CMIP6 data:
+# SSP1-2.6 (low), SSP2-4.5 (moderate), SSP3-7.0 (high), SSP5-8.5 (very high)
+future_ssps <- c("126", "245", "370", "585")
+
+# Near-, mid-, and long-term projections
+future_time <- c("2021-2040", "2041-2060", "2061-2080")
+
+future_scenarios <- expand.grid(
+  gcm = future_gcms,
+  ssp = future_ssps,
+  time = future_time,
+  stringsAsFactors = FALSE
+)
+
+# Download each GCM/SSP/time tile (same tile as the current-climate download
+# above), crop to the study area, and subset to the same VIF-selected predictors
+future_clim <- pmap(future_scenarios, function(gcm, ssp, time) {
+  clim_future_tile <- geodata::cmip6_tile(
+    lon = 135,
+    lat = -45,
+    model = gcm,
+    ssp = ssp,
+    time = time,
+    var = "bio",
+    path = here::here("data")
+  )
+
+  # cmip6_tile() returns the same 19 bioclim variables, in the same order,
+  # as worldclim_tile() above - reuse those names so we can subset by the
+  # VIF-selected predictor names
+  names(clim_future_tile) <- names(clim)
+
+  crop(clim_future_tile, vect(study_area), mask = TRUE)[[names(clim_selected)]]
+})
+
+names(future_clim) <- paste(future_scenarios$gcm, future_scenarios$ssp, future_scenarios$time, sep = "_")
+
+# Spot-check one scenario
+mapview(future_clim[[1]]$bio_3)
+```
+
+### Notes
+
+- This downloads 48 tiles (4 GCMs x 4 SSPs x 3 time periods) at the same resolution/extent as the current-climate tile, rather than 48 global rasters. Each tile is \~80 MB, so expect \~3.8 GB total (some of this may already be cached from earlier runs)
+
+- Worth double-checking that `names(clim_future_tile) <- names(clim)` is a safe assumption - it relies on both tiles containing the same 19 bioclim variables in the same order, which should hold but hasn't been explicitly verified
+
+- The two \~6 GB `cmip6_world()` files downloaded earlier aren't used by this version of the code and can be deleted if you want to reclaim the disk space
+
+## Project the model onto future scenarios
+
+```{r}
+# Project the fitted model onto each future climate scenario, on the same
+# cloglog scale as the current-climate prediction, then apply the same
+# suitability threshold to get binary suitable/unsuitable habitat
+future_suitability <- map(future_clim, \(scenario_clim) {
+  terra::predict(scenario_clim, maxent_model, type = "cloglog", na.rm = TRUE)
+})
+
+future_suitable_habitat <- map(future_suitability, \(s) s >= suitability_threshold)
+
+# Spot-check one scenario against the current-climate prediction
+mapview(suitability, layer.name = "current") +
+  mapview(future_suitability[[1]], layer.name = names(future_suitability)[1])
+```
+
+### Notes
+
+- `future_suitability` holds the continuous cloglog surface per scenario, and `future_suitable_habitat` the binary version at `suitability_threshold` - both keyed by the same `GCM_SSP_time` names as `future_clim`
+
+- This applies the *current* suitability threshold to future predictions, which is standard practice, but worth being explicit about in the write-up
+
+## Quantify habitat change over time
+
+```{r}
+# Area (km^2) of suitable habitat in a binary TRUE/FALSE raster
+suitable_area_km2 <- function(habitat_raster) {
+  areas <- expanse(habitat_raster, unit = "km", byValue = TRUE)
+  suitable <- areas$area[areas$value == 1]
+  if (length(suitable) == 0) 0 else suitable
+}
+
+current_area_km2 <- suitable_area_km2(suitable_habitat)
+
+# future_scenarios and future_suitable_habitat share the same row order, since
+# both were built from the same pmap() call earlier
+ssp_labels <- c(
+  "126" = "SSP1-2.6", "245" = "SSP2-4.5", "370" = "SSP3-7.0", "585" = "SSP5-8.5"
+)
+
+habitat_change <- future_scenarios |>
+  mutate(
+    area_km2 = map_dbl(future_suitable_habitat, suitable_area_km2),
+    current_area_km2 = current_area_km2,
+    change_km2 = area_km2 - current_area_km2,
+    pct_change = 100 * change_km2 / current_area_km2,
+    # Ordered factor so the time periods plot in chronological order
+    time = factor(time, levels = c("2021-2040", "2041-2060", "2061-2080"), ordered = TRUE),
+    ssp_label = factor(ssp_labels[ssp], levels = ssp_labels)
+  )
+
+habitat_change
+```
+
+```{r}
+ggplot(habitat_change, aes(x = time, y = pct_change, colour = gcm, group = gcm)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ssp_label) +
+  labs(
+    title = "Projected change in suitable habitat area over time",
+    x = "Time period", y = "Change in suitable area (%)", colour = "GCM"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+### Notes
+
+- `suitable_area_km2()` sums the area of TRUE cells via `terra::expanse()`, which accounts for cell area distortion (relevant since we're in unprojected lon/lat)
+
+- Worth also reporting the *current* suitable area (`current_area_km2`) as its own figure/stat, not just the % change, since that's part of criterion 2b(iii) too
+
+- Each point is still a single time-slice projection, not a continuous trajectory - worth being explicit about that in the write-up rather than implying a smooth trend between the three time periods
+
+- This only compares suitable habitat *area* - a spatial comparison (e.g. where habitat is lost vs. gained, or a centroid shift) would strengthen the "extent" and "quality" parts of the criterion, and might be worth adding
