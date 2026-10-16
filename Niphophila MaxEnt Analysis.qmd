@@ -15,11 +15,11 @@ The specific criteria being addressed is:
 
 That is, we're trying to quantify the decline in the area of *niphophila* habitat under future climate change projections.
 
-## Some similar analyses
+### Some similar analyses
 
 - Ren, Jun, Suhang Li, Yawen Zhang, Qiong Yang, Jiaojiao Liu, Jing Fan, and Yangzhou Xiang. 2025. ‘MaxEnt-Based Evaluation of Climate Change Effects on the Habitat Suitability of Magnolia Officinalis in China’. *Frontiers in Plant Science* 16:1601585. doi:[10.3389/fpls.2025.1601585](https://doi.org/10.3389/fpls.2025.1601585).
 
-## Useful references for MaxEnt modeling:
+### Useful references for MaxEnt modeling:
 
 - Merow, C., Smith, M. J., & Silander, J. A. (2013). A practical guide to MaxEnt for modeling species’ distributions: What it does, and why inputs and settings matter. Ecography, 36(10), 1058–1069. https://doi.org/10.1111/j.1600-0587.2013.07872.x
 - Elith, J., Phillips, S. J., Hastie, T., Dudík, M., Chee, Y. E., & Yates, C. J. (2011). A statistical explanation of MaxEnt for ecologists: Statistical explanation of MaxEnt. Diversity and Distributions, 17(1), 43–57. https://doi.org/10.1111/j.1472-4642.2010.00725.x
@@ -33,11 +33,12 @@ This section just contains package imports and configurations.
 #| warning: false
 
 library(dplyr)     # Data wrangiling
+library(readr)     # In/out tabular data
 library(purrr)     # Functional programming tools
 library(sf)        # Vector data tools
 library(terra)     # Raster data tools
 library(mapview)   # Quick interactive maps
-library(galah)     # Access species occurence data (Atlas of Living Australia)
+library(galah)     # Access species occurrence data (Atlas of Living Australia)
 library(maxnet)    # Maxent species distribution modeling
 library(ENMeval)   # Tune echological niche models
 library(ggplot2)   # Plotting
@@ -60,11 +61,60 @@ mapviewOptions(
 set.seed(4444)
 ```
 
-## Download the occurrence data
+## Data preparation
 
-The first thing I'll do is import the *E. niphophila* observational data, filtering out low-quality observations and outliers.
+### Download the occurrence data
 
-I'm using the `galah` package to access observations, which compiles data from a number of different sources including the Atlas of Living Australia. Not all of this data is super high quality, but I'm applying some data quality filters to try and select only high-quality records.
+The first thing I'll do is import the *E. niphophila* observational data. I'm using the `galah` package, which accesses data compiled by the Atlas of Living Australia (ALA).
+
+This download comes with a bunch of data quality checks which we can use to exclude low quality observations from the training data.
+
+Descriptions of the environmental variables: <https://biocache.ala.org.au/fields?filter=name%3Ael%5B0-9%5D*&max=100&order=DESC&sort=classs>
+
+Descriptions of the data quality variables: <https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki>
+
+```{r}
+# If niph_raw has already been downloaded, import it. Otherwise, download observations from
+# the Atlas of Living Australia, including many metadata columns.
+
+niph_raw_path <- here::here("data/galah/niph_raw.rds")
+
+if (file.exists(niph_raw_path)) {
+  niph_raw <- readr::read_rds(niph_raw_path)
+} else {
+  
+  # Construct an API call to galah
+  niph_raw_call <- galah_call() |>
+    identify("Eucalyptus pauciflora subsp. niphophila") |>
+    select(
+      group = c(
+        "basic", # record_id, lat/lon, etc.
+        "event", # columns describing the observation process
+        "assertions" # data quality checks
+      ),
+      starts_with("el"), # environmental variables
+      "coordinateUncertaintyInMeters",
+      "spatiallyValid",
+      "isDuplicateOf",
+      "outlierLayerCount",
+      "year",
+      "country",
+      "stateProvince"
+    )
+  
+  # Download our occurrence data
+  niph_raw <- atlas_occurrences(niph_raw_call)
+  
+  # Save the raw data as an rds file
+  write_rds(niph_raw, niph_raw_path)
+}
+
+nrow(niph_raw)
+```
+
+### Filter out low-quality data
+
+Not all of this data is super high quality, so we can apply some data quality filters to try and filter out unreliable records.
 
 The most important data quality filters are
 
@@ -79,72 +129,48 @@ The most important data quality filters are
 - I'm also removing records from before 1970, or which aren't in NSW, ACT, or Victoria.
 
 ```{r}
-niph_occurences_path <- here::here("data/galah/niph_occurences.rds")
-
-# If niph_occurences has already been downloaded, import it. 
-# Otherwise, download observations from the Atlas of Living Australia. This data 
-# download generates a doi for reproducibility
-
-if (file.exists(niph_occurences_path)) {
-  niph_occurences <- readr::read_rds(niph_occurences_path)
-} else {
-  
-  niph_cols <- c(
-    "recordID", 
-    "scientificName", 
-    "decimalLatitude", 
-    "decimalLongitude", 
-    "coordinateUncertaintyInMeters",
-    "eventDate", 
-    "year",
-    "basisOfRecord", 
-    "identifiedBy",
-    "locality",
-    "stateProvince",
-    "dataResourceName", 
-    "institutionCode"
+niph_raw_filtered <- niph_raw |> 
+  filter(
+    occurrenceStatus == "PRESENT", # Not actually necissary, but reassuring
+    !is.na(decimalLongitude), 
+    !is.na(decimalLatitude),
+    coordinateUncertaintyInMeters <= 1000,
+    spatiallyValid == TRUE,
+    is.na(isDuplicateOf),
+    outlierLayerCount == 0,
+    year >= 1970,
+    country == "Australia",
+    stateProvince %in% c("Victoria", "Australian Capital Territory", "New South Wales")
   )
-  
-  niph_occurences <- galah_call() |>
-    identify("Eucalyptus pauciflora subsp. niphophila") |>
-    filter(
-      occurrenceStatus == "PRESENT",
-      !is.na(decimalLongitude), 
-      !is.na(decimalLatitude),
-      coordinateUncertaintyInMeters <= 1000,
-      spatiallyValid == TRUE,
-      is.na(isDuplicateOf),
-      outlierLayerCount == 0,
-      year >= 1970,
-      country == "Australia",
-      stateProvince != "Tasmania"
-    ) |>
-    select(all_of(niph_cols)) |>
-    atlas_occurrences(
-      mint_doi = TRUE,
-      file = "niph_occurences.zip"
-    )
-  
-  readr::write_rds(niph_occurences, niph_occurences_path)
-}
 
-niph_occurences
+nrow(niph_raw_filtered)
 ```
 
-## Targeted data quality checks
+## Targeted outlier removal
 
-Let's convert our data to a spatial object and see how it looks on a map.
+Let's see how our filtered data looks on a map.
 
 ```{r}
-niph_occurences_sf <- niph_occurences |> 
-  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
-
-mapview(niph_occurences_sf)
+niph_raw_filtered |> 
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326) |> 
+  mapview()
 ```
 
 Some observations are still suspicious.
 
-## Filter out low-quality observations
++--------------------------------------+-----------------------------------------------------------------------------------------+
+| **recordID**                         | Reason for removal                                                                      |
++======================================+=========================================================================================+
+| 2c4dd780-74ef-4337-893b-250e47aa64a8 | In Grampians NP, well outside known range                                               |
++--------------------------------------+-----------------------------------------------------------------------------------------+
+| f1047be9-66f7-4ba6-9157-d0f1d906fa12 | In Baw Baw NP and from 1994, so likely to be the Baw Baw subspecies (described in 1994) |
+|                                      |                                                                                         |
+| 56c4cb9d-db98-4f0c-8080-d75a281a5b06 |                                                                                         |
++--------------------------------------+-----------------------------------------------------------------------------------------+
+|                                      |                                                                                         |
++--------------------------------------+-----------------------------------------------------------------------------------------+
+
+Filter out low-quality observations
 
 As an additional data quality check I'm going to look up the elevation of each point.
 
@@ -218,7 +244,7 @@ mapview(study_area, alpha.regions = 0.5, lwd = 2, alpha = 1) +
 
 ```{r}
 
-# Define the study area around the occurence data using a buffered convex hull
+# Define the study area around the occurrence data using a buffered convex hull
 # This is basically like putting a rubber band around the observations, plus a 20 km buffer
 # 
 # study_area <- niph |>
