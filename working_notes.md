@@ -60,3 +60,7 @@
 - [ ] Consider jittering points inside spatial bound when running model
 - [ ] Should there be a cut-off for observation dates?
 - [ ] Still haven't looked into the transects
+
+## 2026-10-17
+
+- [ ] At some point, I should make my cleaning flags explicit so that they can be counted

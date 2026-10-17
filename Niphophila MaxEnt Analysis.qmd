@@ -85,7 +85,7 @@ crs_proj <- 7855 # GDA2020 / MGA zone 55 (144°E–150°E)
 
 ### Download the occurrence data
 
-The first thing I'll do is import the *E. niphophila* observational data. I'm using the `galah` package, which lets me access all of the data compiled by the Atlas of Living Australia (ALA). Observations come from a number of sources such as government agencies, herbaria, and individuals.
+The first thing I'll do is import the *E. niphophila* observational data. I'm using the `galah` package, which lets me access all of the data compiled by the Atlas of Living Australia (ALA). Observations come from a number of sources such as government agencies (mostly DEECCEW, herbaria, and iNaturalist.
 
 I'm going to download just about every column that could possibly be of use, including a bunch of built-in data quality checks which we can use to exclude low quality observations from the training data.
 
@@ -238,7 +238,7 @@ niph_filtered_sf |>
 
 ### Check the elevations
 
-*Niphophila* is known to inhabit altitudes above 1600 m. To allow for some natural variation we'll allow records down to 1400 m, but any records below this altitude will be removed.
+*Niphophila* is known to inhabit altitudes above 1600 m. To allow for some natural variation we'll allow records down to 1400 m, but any records below this altitude will be removed as they have a higher likelihood of being misidentified.
 
 ```{r}
 # Download a 5 degree tile of 3s elevation data which covers the observations.
@@ -353,7 +353,7 @@ niph_sf |>
   mapview()
 ```
 
-Yeah, so 1999 is the year of those transects. It is possible that those records will have to be removed.
+Yeah, so 1999 is the year of those transects. It is possible that those records will have to be thinned or removed.
 
 ```{r}
 niph |>
@@ -412,6 +412,70 @@ count(niph, identifiedBy) |> arrange(-n) |> print()
 Thanks jackiemiles.
 
 ## Define the study area
+
+The study area is the region of environmental conditions we're interesting in contrasting our presence values against, i.e. places *Niphophila* could have reached and been recorded. We also need to include area beyond this range to give the model something to compare against.
+
+I'll be basing the study area on the Australian Alps bioregion. All of our observations are within or very close to this area, however some parts of the bioregion have no observations and so either haven't been surveyed or aren't candidates for dispersal. As such, I'll remove any polygons which don't have an observation within 1 km.
+
+```{r}
+# To look at distances between points we need to move to a projected CRS
+
+niph_proj <- niph_sf |> 
+  st_transform(crs_proj)
+
+aus_alps_proj <- aus_alps |> 
+  st_transform(crs_proj) |> 
+  st_cast("POLYGON")
+
+# Check if our points are within 1000 m of an observation
+
+within_dist <- lengths(st_is_within_distance(aus_alps_proj, niph_proj, dist = 1000)) > 0
+
+aus_alps_parts <- st_sf(geometry = aus_alps_proj) |> 
+  mutate(keep = within_dist)
+
+mapview(aus_alps_parts, zcol = "keep") +
+  mapview(niph_proj, col.regions = "purple")
+```
+
+To finish creating the study area I'll add a small buffer around the remaining polygons. This accounts for uncertainty in the bioregion definition.
+
+```{r}
+study_area <- aus_alps_parts |> 
+  filter(keep) |> 
+  st_union() |> 
+  st_buffer(dist = 100, joinStyle = "MITRE", mitreLimit = 2) |> 
+  smoothr::fill_holes(units::set_units(1, km^2)) |> 
+  smoothr::smooth(method = "ksmooth", smoothness = 2) |> 
+  st_transform(crs_geog) |> 
+  st_make_valid()
+
+mapview(study_area, alpha.regions = 0.3, lwd = 2, alpha = 1) +
+  mapview(niph_sf, col.regions = "purple")
+```
+
+```{r}
+# Double check that all observations are within the study area (expect 0 rows)
+
+st_filter(niph_sf, study_area, .predicate = st_disjoint) |> 
+  nrow()
+```
+
+Let's have a look at the elevation distribution in our study area.
+
+```{r}
+study_area_elev <- elev_3s |>
+  crop(vect(study_area)) |>
+  mask(vect(study_area))
+
+plot(study_area_elev)
+```
+
+```{r}
+hist(study_area_elev, breaks = 50, maxcell = ncell(study_area_elev))
+```
+
+A large portion of our study area is below the 1400 m elevation threshold, which is important for providing a comparison area.
 
 We can define a plausible habitat area using a combination of the Australian Alps bioregion and elevation data.
 
