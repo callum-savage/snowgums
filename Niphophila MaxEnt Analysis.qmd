@@ -33,12 +33,14 @@ This section just contains package imports and configurations.
 #| warning: false
 
 library(dplyr)     # Data wrangiling
+library(tidyr)     # Moving data between tall and wide formats
 library(readr)     # In/out tabular data
 library(purrr)     # Functional programming tools
 library(sf)        # Vector data tools
 library(terra)     # Raster data tools
 library(mapview)   # Quick interactive maps
 library(galah)     # Access species occurrence data (Atlas of Living Australia)
+library(geodata)   # Access climate data, including projections
 library(maxnet)    # Maxent species distribution modeling
 library(ENMeval)   # Tune echological niche models
 library(ggplot2)   # Plotting
@@ -475,17 +477,17 @@ hist(study_area_elev, breaks = 50, maxcell = ncell(study_area_elev))
 
 A large portion of our study area is below the 1400 m elevation threshold. I think this is good as it gives us information on non-habitat.
 
-## Prepare climate data
+## Prepare current climate data
 
-### Download climate data
+### Download current climate data
 
-We can download gridded climate data from [WorldClim](https://www.worldclim.org/) at 30 second resolution (\~1 km² grid cells).
+We can download gridded climate data from [WorldClim](https://www.worldclim.org/) at 30 second resolution (\~1 km² grid cells). This data has been averaged over the period 1970-2000.
 
 ```{r}
 # WorldClim climate data is stored as 30x30 degree tiles. 
 # Luckily, we only need one tile to cover the study area
 
-clim_tile <- geodata::worldclim_tile(
+clim_tile <- worldclim_tile(
   var = "bio",
   res = "0.5", # 0.5 minute resolution
   lon = 135,
@@ -533,7 +535,426 @@ plot_vars <- c("bio_1", "bio_2", "bio_5", "bio_6", "bio_7", "bio_12")
 plot(clim[[plot_vars]], main = bio_names[plot_vars])
 ```
 
-## 
+### Download future climate projections
+
+We can download future climate projections from WorldClim's CMIP6 downscaled data. This matches the grid of our baseline climate date.
+
+WorldClim gives us data at four time periods (2021-2040, 2041-2060, 2061-2080, and 2081-2100) across four Shared Socio-economic Pathways (SSPs).
+
+Shared Socio-economic Pathways (SSP):
+
+| Name | AR6 Emissions Label | Narrative | Warming by 2100 (°C) |
+|----|----|----|----|
+| SSP1-2.6 | Low | Sustainability | 1.8 |
+| SSP2-4.5 | Intermediate | Middle of the road | 2.7 |
+| SSP3-7.0 | High | Regional rivalry | 3.6 |
+| SSP5-8.5 | Very high | Fossil-fuelled development | 4.4 |
+
+Rather than a single climate model, we use a spread of CMIP6 GCMs (Global Climate Models) so we can later assess how much projected habitat change depends on the choice of model. WorldClim has 26 CMIP6 GCMs which is frankly too many for our purposes. If we were to use all of them we would also be introducing a new source of bias as the models are not spread evenly over the scope of possible future climatic conditions (CMIP6 had the 'hot model' problem).
+
+We can narrow down the list of GCMs by looking at how they vary across key variables. We want to select an ensemble of \~5 models which represent a spread of possible futures whilst avoiding actual outliers.
+
+To start with, I'll download a single tile of data for each GCM and look at how precipitation and temperature vary into the future.
+
+```{r}
+# The scenario and period we're using for testing
+
+test_scenario <- "245"
+test_period <- "2061-2080"
+
+# List all GCM candidates. 
+# The ones which have been commented out don't have data for all scenario/year combinations
+
+gcm_candidates <- c(
+  "ACCESS-CM2",
+  "ACCESS-ESM1-5",
+  "AWI-CM-1-1-MR",
+  "BCC-CSM2-MR",
+  "CanESM5",
+  "CanESM5-CanOE",
+  "CMCC-ESM2",
+  "CNRM-CM6-1",
+  "CNRM-CM6-1-HR",
+  "CNRM-ESM2-1",
+  "EC-Earth3-Veg",
+  "EC-Earth3-Veg-LR",
+  #"FIO-ESM-2-0", # Unavailable
+  #"GFDL-ESM4",
+  "GISS-E2-1-G",
+  "GISS-E2-1-H",
+  #"HadGEM3-GC31-LL",
+  "INM-CM4-8",
+  "INM-CM5-0",
+  "IPSL-CM6A-LR",
+  "MIROC6",
+  "MIROC-ES2L",
+  "MPI-ESM1-2-HR",
+  "MPI-ESM1-2-LR",
+  "MRI-ESM2-0",
+  "UKESM1-0-LL"
+)
+
+# Extract the currnet mean values across our study area
+
+bio_vars <- paste0("bio_", 1:19)
+
+current <- global(clim[[bio_vars]], "mean", na.rm = TRUE)$mean
+
+# Loop over all candidate gcms and calculate the mean value of each variable
+# across the study area
+
+results <- list()
+
+for (gcm in gcm_candidates) {
+  
+  # Download/import the tile of data
+  
+  tile <- cmip6_tile(
+    lon = 135,
+    lat = -45,
+    model = gcm,
+    ssp = test_scenario,
+    time = test_period,
+    var = "bio",
+    path = here::here("data")
+  )
+  
+  names(tile) <- bio_vars
+  
+  # Crop to the study area
+  
+  tile <- crop(tile, study_area_vect, snap = "out")
+  tile <- mask(tile, study_area_vect, touches = TRUE)
+  
+  # Calculate the means
+  
+  means <- global(tile, "mean", na.rm = TRUE)$mean
+  
+  # Create a tibble of the results and save it to the results list
+  
+  results[[gcm]] <- tibble(gcm, var = bio_vars, current, future = means)
+}
+
+# Combine the list of results into a single tibble and calculate changes compared
+# with current values
+
+gcm_change <- bind_rows(results) |>
+  mutate(
+    change = future - current,
+    change_pct = 100 * change / current,
+  )
+
+gcm_change
+```
+
+We can now look at how these variables change into the future for each GCM.
+
+```{r}
+# Define a plotting helper to plot variable pairs
+
+plot_spread <- function(x, y, title = NULL) {
+  gcm_vars <- gcm_change |>
+    # Use percent change for precip variables
+    mutate(change_plot = if_else(
+      var %in% paste0("bio_", 12:19), 
+      change_pct, 
+      change
+    )) |> 
+    select(gcm, var, change_plot) |>
+    pivot_wider(names_from = var, values_from = change_plot)
+  
+  gcm_vars |>
+    ggplot(aes(.data[[x]], .data[[y]], label = gcm)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_point() +
+    ggrepel::geom_text_repel(size = 3) +
+    labs(
+      x = paste("Change in", bio_names[x]),
+      y = paste("Change in", bio_names[y]),
+      title = title
+    )
+}
+
+plot_spread("bio_6", "bio_14", "GCM spread over study area, SSP2-4.5, 2061–2080")
+```
+
+```{r}
+plot_spread <- function(x, y, title = NULL) {
+  gcm_change |>
+    select(gcm, var, change_plot) |>
+    pivot_wider(names_from = var, values_from = change_plot) |>
+    ggplot(aes(.data[[x]], .data[[y]], label = gcm)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_point() +
+    ggrepel::geom_text_repel(size = 3) +
+    labs(x = paste("Change in", bio_names[x]),
+         y = paste("Change in", bio_names[y]),
+         title = title)
+}
+
+plot_spread("bio_6", "bio_14", "GCM spread over study area, SSP2-4.5, 2061–2080")
+plot_spread("bio_4", "bio_15", "GCM spread over study area, SSP2-4.5, 2061–2080")
+```
+
+There's a few strategies we can use to narrow down this list:
+
+- We we only need one model from each family as they will tend to produce similar results (e.g. CanESM5 and CanESM5-CanOE).
+
+- We can exclude the models which are known to run hot or cool when compared with observations.
+
+- We can prioritise the ACCESS models as they were developed with the Australian climate in mind.
+
+- And finally, we can look at the models which we have left and choose the ones which give us a spread of conditions across key variables.
+
+```{r}
+# Applying the first three rules, we get the following list of candidate models. 
+# Full disclosure: I used AI to narrow down this list as otherwise it would take forever.
+
+gcm_candidates <- c(
+  "ACCESS-CM2",
+  "ACCESS-ESM1-5",
+  "BCC-CSM2-MR",
+  "CMCC-ESM2",
+  "EC-Earth3-Veg",
+  "GISS-E2-1-G",
+  "INM-CM5-0",
+  "IPSL-CM6A-LR",
+  "MIROC6",
+  "MPI-ESM1-2-HR",
+  "MRI-ESM2-0",
+  "UKESM1-0-LL"
+)
+
+gcm_candidates <- c(
+  "ACCESS-CM2",
+  "ACCESS-ESM1-5",
+  "AWI-CM-1-1-MR",
+  "BCC-CSM2-MR",
+  "CanESM5",
+  "CanESM5-CanOE",
+  "CMCC-ESM2",
+  "CNRM-CM6-1",
+  "CNRM-CM6-1-HR",
+  "CNRM-ESM2-1",
+  "EC-Earth3-Veg",
+  "EC-Earth3-Veg-LR",
+  #"FIO-ESM-2-0", # Unavailable
+  #"GFDL-ESM4",
+  "GISS-E2-1-G",
+  "GISS-E2-1-H",
+  #"HadGEM3-GC31-LL",
+  "INM-CM4-8",
+  "INM-CM5-0",
+  "IPSL-CM6A-LR",
+  "MIROC6",
+  "MIROC-ES2L",
+  "MPI-ESM1-2-HR",
+  "MPI-ESM1-2-LR",
+  "MRI-ESM2-0",
+  "UKESM1-0-LL"
+)
+
+# Download a single tile for each GCM. I'm using SSP2-4.5 in 2061-2080.
+
+walk(gcm_candidates, function(gcm) {
+  geodata::cmip6_tile(
+    lon = 135, lat = -45,
+    model = gcm, ssp = "245", time = "2061-2080",
+    var = "bio",
+    path = here::here("data")
+  )
+})
+
+# Select some comparison variables
+
+comparison_vars <- c("bio_1", "bio_12")
+
+# Current baseline
+
+current <- global(clim[[comparison_vars]], "mean", na.rm = TRUE)$mean
+
+# Empty table to fill
+gcm_change <- tibble(gcm = gcm_candidates, d_temp = NA_real_, d_precip = NA_real_)
+
+for (i in seq_along(gcm_candidates)) {
+  print(gcm_candidates[i])
+  fut <- geodata::cmip6_tile(lon = 135, lat = -45,
+                             model = gcm_candidates[i],
+                             ssp = "370", time = "2061-2080",
+                             var = "bio", path = here::here("data"))
+  
+  fut <- fut[[c(1, 12)]]
+  fut <- crop(fut, study_area_vect, snap = "out")
+  fut <- mask(fut, study_area_vect, touches = TRUE)
+  
+  m <- global(fut, "mean", na.rm = TRUE)$mean
+  
+  gcm_change$d_temp[i]   <- m[1] - current[1]
+  gcm_change$d_precip[i] <- 100 * (m[2] - current[2]) / current[2]
+}
+
+
+ggplot(gcm_change, aes(d_temp, d_precip, label = gcm)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point() +
+  ggrepel::geom_text_repel(size = 3) +
+  labs(x = "Change in mean annual temperature (°C)",
+       y = "Change in annual precipitation (%)",
+       title = "GCM spread over study area, SSP2-4.5, 2061–2080")
+```
+
+```{r}
+
+current <- global(clim[[c("bio_6", "bio_14")]], "mean", na.rm = TRUE)$mean
+
+gcm_change <- tibble(gcm = gcm_candidates, d_tmin = NA_real_, d_pdry = NA_real_)
+
+for (i in seq_along(gcm_candidates)) {
+  fut <- geodata::cmip6_tile(lon = 135, lat = -45,
+                             model = gcm_candidates[i],
+                             ssp = "245", time = "2061-2080",
+                             var = "bio", path = here::here("data"))
+  
+  fut <- fut[[c(6, 14)]]
+  fut <- crop(fut, study_area_vect, snap = "out")
+  fut <- mask(fut, study_area_vect, touches = TRUE)
+  
+  m <- global(fut, "mean", na.rm = TRUE)$mean
+  
+  gcm_change$d_tmin[i] <- m[1] - current[1]
+  gcm_change$d_pdry[i] <- 100 * (m[2] - current[2]) / current[2]
+}
+
+ggplot(gcm_change, aes(d_tmin, d_pdry, label = gcm)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point() +
+  ggrepel::geom_text_repel(size = 3) +
+  labs(x = "Change in min temp of coldest month (°C)",
+       y = "Change in precip of driest month (%)",
+       title = "GCM spread over study area, SSP2-4.5, 2061–2080")
+
+
+
+```
+
+To choose a smaller ensemble of GCMs we can download one tile from each model family and look at how they
+
+```{r}
+
+# Download the data for all available GCMs. We won't end up using all of them
+
+future_gcms <- c(
+  "ACCESS-CM2",
+  "ACCESS-ESM1-5",
+  "AWI-CM-1-1-MR",
+  "BCC-CSM2-MR",
+  "CanESM5",
+  "CanESM5-CanOE",
+  "CMCC-ESM2",
+  "CNRM-CM6-1",
+  "CNRM-CM6-1-HR",
+  "CNRM-ESM2-1",
+  "EC-Earth3-Veg",
+  "EC-Earth3-Veg-LR",
+  "FIO-ESM-2-0",
+  "GFDL-ESM4",
+  "GISS-E2-1-G",
+  "GISS-E2-1-H",
+  "HadGEM3-GC31-LL",
+  "INM-CM4-8",
+  "INM-CM5-0",
+  "IPSL-CM6A-LR",
+  "MIROC-ES2L",
+  "MIROC6",
+  "MPI-ESM1-2-HR",
+  "MPI-ESM1-2-LR",
+  "MRI-ESM2-0",
+  "UKESM1-0-LL"
+)
+
+# All four available SSPs:
+
+future_ssps <- c("126", "245", "370", "585")
+
+# Now-, near-, mid-, and long-term projections
+
+future_time <- c("2021-2040", "2041-2060", "2061-2080")
+
+# Create a list of the data tiles we want
+
+future_scenarios <- expand.grid(
+  gcm = future_gcms,
+  ssp = future_ssps,
+  time = future_time,
+  stringsAsFactors = FALSE
+)
+
+# Download the tiles and save them to data/climate/wc2.1_30s. Geodata is smart and
+# only downloads each file once
+
+pwalk(future_scenarios, function(gcm, ssp, time) {
+  geodata::cmip6_tile(
+    lon = 135, lat = -45,
+    model = gcm, ssp = ssp, time = time,
+    var = "bio",
+    path = here::here("data")
+  )
+})
+```
+
+```{r}
+# GCMs chosen to span a range of climate sensitivity (cooler to hotter projections)
+future_gcms <- c("MIROC6", "MPI-ESM1-2-HR", "IPSL-CM6A-LR", "ACCESS-CM2")
+
+# All four SSPs (emissions scenarios) available from WorldClim's CMIP6 data:
+# SSP1-2.6 (low), SSP2-4.5 (moderate), SSP3-7.0 (high), SSP5-8.5 (very high)
+future_ssps <- c("126", "245", "370", "585")
+
+# Now-, near-, mid-, and long-term projections
+future_time <- c("2021-2040", "2041-2060", "2061-2080", "2081-2100")
+
+future_scenarios <- expand.grid(
+  gcm = future_gcms,
+  ssp = future_ssps,
+  time = future_time,
+  stringsAsFactors = FALSE
+)
+
+# Download each GCM/SSP/time tile (same tile as the current-climate download
+# above), crop to the study area, and subset to the same VIF-selected predictors
+future_clim <- pmap(future_scenarios, function(gcm, ssp, time) {
+  clim_future_tile <- geodata::cmip6_tile(
+    lon = 135,
+    lat = -45,
+    model = gcm,
+    ssp = ssp,
+    time = time,
+    var = "bio",
+    path = here::here("data")
+  )
+
+  # cmip6_tile() returns the same 19 bioclim variables, in the same order,
+  # as worldclim_tile() above - reuse those names so we can subset by the
+  # VIF-selected predictor names
+  names(clim_future_tile) <- names(clim)
+
+  crop(clim_future_tile, vect(study_area), mask = TRUE)[[names(clim_selected)]]
+})
+
+names(future_clim) <- paste(future_scenarios$gcm, future_scenarios$ssp, future_scenarios$time, sep = "_")
+
+# Spot-check one scenario
+mapview(future_clim[[1]]$bio_3)
+```
+
+### Notes
+
+- This downloads 48 tiles (4 GCMs x 4 SSPs x 3 time periods) at the same resolution/extent as the current-climate tile, rather than 48 global rasters. Each tile is \~80 MB, so expect \~3.8 GB total (some of this may already be cached from earlier runs)
+
+- Worth double-checking that `names(clim_future_tile) <- names(clim)` is a safe assumption - it relies on both tiles containing the same 19 bioclim variables in the same order, which should hold but hasn't been explicitly verified
+
+- The two \~6 GB `cmip6_world()` files downloaded earlier aren't used by this version of the code and can be deleted if you want to reclaim the disk space
 
 ## Spatial thinning
 
@@ -696,7 +1117,7 @@ We can download climate data from [WorldClim](https://www.worldclim.org/) at 30 
 ```{r}
 # WorldClim climate data is stored as 30x30 degree tiles. 
 # We only need one tile to cover the study area
-clim_tile <- geodata::worldclim_tile(
+clim_tile <- worldclim_tile(
   var = "bio",
   res = "0.5", # 0.5 minute resolution
   lon = 135,
@@ -743,7 +1164,7 @@ Many of these predictor variables are highly co-linear (e.g. Precipitation of We
 bg_points <- st_sample(study_area, size = 10000, type = "random")
 
 # Extract climate values at these points
-clim_vals <- terra::extract(clim, vect(bg_points), ID = FALSE) |> 
+clim_vals <- extract(clim, vect(bg_points), ID = FALSE) |> 
   na.omit()
 
 # Calculate a correlation matrix of the variables across our study area
