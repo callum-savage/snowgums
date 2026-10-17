@@ -1,8 +1,12 @@
 ---
 title: "Snowgums MaxEnt Analysis"
 author: "Callum Savage"
-format: html
+format:
+  html:
+    df-print: tibble
 editor: visual
+editor_options: 
+  chunk_output_type: inline
 ---
 
 ## Introduction
@@ -59,6 +63,12 @@ mapviewOptions(
   legend = FALSE,
   cex = 4,
   alpha = 0.2
+)
+
+# Set the default ggplot themeing
+
+theme_set(
+  theme_minimal(base_size = 12)
 )
 
 # Choose a random number seed so results are reproducible
@@ -318,6 +328,88 @@ niph_outside_aus_alps |>
 ```
 
 Okay, so they're all within 100 m of the bioregion, which is within the bounds of their positional uncertainty. As there is also some inaccuracy in the bioregion definition I'm inclined to keep them in the data set - excluding them would be arbitrary.
+
+### Inspect our observational data
+
+```{r}
+niph_sf <- niph_elev_filter_sf
+niph <- as_tibble(niph_sf)
+
+niph
+```
+
+```{r}
+niph |> 
+  ggplot(aes(x = year)) +
+  geom_bar() +
+  labs(x = "Year", y = "Records", title = "Observations by year")
+```
+
+It looks like there was a spike in observations in 1990 - I assume this is due to a specific survey but it's worth checking.
+
+```{r}
+niph_sf |> 
+  filter(year == 1999) |> 
+  mapview()
+```
+
+Yeah, so 1999 is the year of those transects. It is possible that those records will have to be removed.
+
+```{r}
+niph |>
+  ggplot(aes(forcats::fct_infreq(basisOfRecord))) +
+  geom_bar() +
+  geom_text(aes(label = after_stat(count)), stat = "count", hjust = -0.2) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = NULL, y = "Records")
+```
+
+Most of our observations are human observations which is great. The single records with 'occurrence' and 'living specimen' are likely to be coding irregularities.
+
+```{r}
+niph |>
+  ggplot(aes(elevation_m)) +
+  geom_histogram(binwidth = 25, boundary = 1400) +
+  geom_vline(xintercept = 1400, linetype = "dashed") +
+  labs(x = "Elevation (m)", y = "Records", title = "Histogram of observation elevations")
+```
+
+This looks roughly like what we'd expect. Most observations are below 1800, though this could just be limited by the limited amount of terrain above 1800 m.
+
+```{r}
+niph |>
+  ggplot(aes(coordinateUncertaintyInMeters)) +
+  geom_histogram(binwidth = 50, boundary = 0) +
+  geom_vline(xintercept = 1000, linetype = "dashed") +
+  labs(x = "Coordinate uncertainty (m)", y = "Records")
+```
+
+Interesting, it looks like the majority of our records are actually more accurate than I was giving them credit for. The spikes at 500 m and 1000 m would have been set manually. It might actually be worth considering if a stricter coordinate uncertainty limit would be worthwhile, given we'd be losing relatively few points.
+
+```{r}
+count(niph, stateProvince) |> print()
+```
+
+NSW seems to quite heavily weighted in our data. I think that's primarily because there have been some systematic transects in the NSW Alps.
+
+```{r}
+count(niph, dataResourceName) |> arrange(-n) |> print()
+```
+
+NSW BioNet Atlas being the largest data source tracks with the high occurrence of NSW data points.
+
+```{r}
+count(niph, institutionCode) |> arrange(-n) |> print()
+```
+
+DCCEEW and iNaturalist together provide most of our data.
+
+```{r}
+count(niph, identifiedBy) |> arrange(-n) |> print()
+```
+
+Thanks jackiemiles.
 
 ## Define the study area
 
