@@ -36,19 +36,26 @@ library(dplyr)     # Data wrangiling
 library(tidyr)     # Moving data between tall and wide formats
 library(readr)     # In/out tabular data
 library(purrr)     # Functional programming tools
+library(ggplot2)   # Plotting
 library(sf)        # Vector data tools
 library(terra)     # Raster data tools
 library(mapview)   # Quick interactive maps
 library(galah)     # Access species occurrence data (Atlas of Living Australia)
-library(geodata)   # Access climate data, including projections
-library(maxnet)    # Maxent species distribution modeling
-library(ENMeval)   # Tune echological niche models
-library(ggplot2)   # Plotting
+#library(geodata)   # Access climate data, including projections
+#library(maxnet)    # Maxent species distribution modeling
+#library(ENMeval)   # Tune echological niche models
+
+# Also used via pkg::fun():
+# conflicted, mapview, corrplot, geodata, smoothr, spThin, predicts,
+# ggrepel, here, units, readr
+
+conflicted::conflict_prefer("extract", "terra")
+conflicted::conflict_prefer("filter", "dplyr")
 
 # An email (attached to an account) is required for galah requiests
 # If you're adapting this code please don't use my email
 
-galah_config(
+galah::galah_config(
   email = "callum.savage@student.unimelb.edu.au",
   caching = TRUE,
   directory = here::here("data/galah")
@@ -56,7 +63,7 @@ galah_config(
 
 # Set some default mapview parameters
 
-mapviewOptions(
+mapview::mapviewOptions(
   basemaps = c("Esri.WorldTopoMap", "Esri.WorldImagery", "Esri.NatGeoWorldMap"),
   legend = FALSE,
   cex = 4,
@@ -65,7 +72,7 @@ mapviewOptions(
 
 # Set the default ggplot themeing
 
-theme_set(
+ggplot2::theme_set(
   theme_minimal(base_size = 12)
 )
 
@@ -132,7 +139,7 @@ if (file.exists(niph_raw_path)) {
   
   # Save the raw data as an rds file
   
-  write_rds(niph_raw, niph_raw_path)
+  readr::write_rds(niph_raw, niph_raw_path)
 }
 
 cat("Number of unfiltered Niphophila observations: ", nrow(niph_raw))
@@ -487,7 +494,7 @@ We can download gridded climate data from [WorldClim](https://www.worldclim.org/
 # WorldClim climate data is stored as 30x30 degree tiles. 
 # Luckily, we only need one tile to cover the study area
 
-clim_tile <- worldclim_tile(
+clim_tile <- geodata::worldclim_tile(
   var = "bio",
   res = "0.5", # 0.5 minute resolution
   lon = 135,
@@ -534,6 +541,157 @@ plot_vars <- c("bio_1", "bio_2", "bio_5", "bio_6", "bio_7", "bio_12")
 
 plot(clim[[plot_vars]], main = bio_names[plot_vars])
 ```
+
+### Predictor selection
+
+Many of these environmental variables are highly co-linear (they are all derived from monthly precipitation and temperature), and including all of them can cause model instability and make it difficult to assess the actual importance of each variable.
+
+We can see this if we create a correlation plot.
+
+```{r}
+clim_corr <- layerCor(clim, "pearson", na.rm = TRUE)$correlation
+
+corrplot::corrplot(
+  clim_corr,
+  method = "circle", 
+  type = "upper",
+  tl.col = "black"
+  )
+```
+
+To deal with this, we can refine our variables down into a more meaningful set of predictors.
+
+The four 'interactive' variables (bio_8, bio_9, bio_18, bio_19) combine information about both temperature and precipitation, and are known to have non-physical discontinuities due to variation in which quarter is wettest or warmest. These are easy candidates for removal.
+
+To narrow down the rest of the variables we can use the Variance Inflation Factor (VIF):
+
+1.  Regress each variable against all other variables and get an $R^2$ which is a measure of the variable's variation that can't be explained by other variables.
+2.  Calculate $VIF = 1 / (1-R^2)$.
+3.  If the highest VIF is above a threshold (e.g 10) remove that variable.
+4.  Recalculate the VIF for the remaining variables (which will have changed).
+5.  Repeat until every VIF is below the threshold.
+
+In practice this is implemented by `usdm::vifstep`.
+
+```{r}
+# First, remove the interactive variables
+
+interactive_vars <- c("bio_8", "bio_9", "bio_18", "bio_19")
+
+clim_candidates <- clim[[setdiff(names(clim), interactive_vars)]]
+
+# Then do the VIF analysis
+
+vif_threshold <- 10
+
+vif_exclusions <- usdm::vifstep(clim_candidates, th = vif_threshold) 
+
+#clim_selected <- usdm::exclude(clim_candidates, vif_exclusions)
+
+vif_exclusions
+```
+
+Using the VIF analysis we've lost bio_6, minimum temperature of the coldest month. It's probably accounted for by bio_1, bio_3, and bio_4 however I kind of want bio_6 in as it captures things like frost and snow. The correlation between bio_14 and bio_1 is also higher than I'd like (-0.87)
+
+So, I'll run the VIF analysis again but forcing bio_6 to be included.
+
+```{r}
+vif_exclusions2 <- usdm::vifstep(clim_candidates, th = vif_threshold, keep = "bio_6") 
+
+vif_exclusions2
+```
+
+In this set bio_6 (minimum temperature of the coldest month) has been exchanged for bio_1 (annual mean temperature). I think this is probably for the best as minimum temperatures are going to be more important for snowgums. The maximum correlation between any two variables has also been reduced, though at -0.72 it's still quite high.
+
+```{r}
+clim_selected <- usdm::exclude(clim_candidates, vif_exclusions2)
+
+plot(clim_selected, main = bio_names[names(clim_selected)])
+```
+
+### Environmental similarity analysis
+
+Let's see how the landscape varies with respect to the areas around our occurrence points. To do this we can construct a Multivariate Environmental Similarity Surface (MESS). This involves calculating a similarity score for each variable and each cell when compared with our observations. The MESS value is the most dissimilar score across all variables.
+
+```{r}
+# We'll do the MESS analysis using our selected variables
+
+mess_vars <- names(clim_selected)
+
+mess_area <- crop(clim_tile[[mess_vars]], ext(145.5, 152, -38, -35))
+
+# Extract the climatic variables at each observation
+
+occs_z <- terra::extract(mess_area, niph_vect, ID = FALSE) |>
+  drop_na()
+
+# Get the MESS values across the full tile (not just the study area)
+
+occs_mess <- predicts::mess(mess_area, occs_z, full = TRUE)
+
+# Construct a MESS plot, overlayed with our study area
+
+plot(occs_mess[["mess"]], col = hcl.colors(100, "RdBu"), main = "Environmental similarity")
+plot(study_area_vect, border = "black", lwd = 1, add = TRUE)
+```
+
+And another version where the similarity has been binned so it's a bit easier to interpret.
+
+```{r}
+# Define breaks and colours
+
+breaks <- c(-Inf, -50, -20, -10, 0, 10, 20, 50, 100)
+colours <- hcl.colors(length(brks) - 1, "RdBu")
+
+plot(occs_mess[["mess"]], breaks = breaks, col = colours, main = "Environmental similarity")
+plot(study_area_vect, border = "black", lwd = 1, add = TRUE)
+```
+
+Okay, looking pretty good then. Our study area captures all of the core habitat areas and there aren't any areas with a highly similar environment outside of our study area. There are some large chunks of our study area that have close to zero similarity, however there's not much that's actually dissimilar.
+
+Let's actually calculate how much of the study area is dissimilar.
+
+```{r}
+# Extract the MESS values in the study area
+
+stud_area_mess <- mask(crop(occs_mess, study_area_vect), study_area_vect)
+
+# Find the proporation of negative MESS values
+
+100 * global(sa_mess < 0, "mean", na.rm = TRUE)[[1]]
+```
+
+So 14% of our study area is dissimilar to our observations, which seems acceptable.
+
+We can also see which variables are driving the dissimilarity.
+
+```{r}
+# Find the index of the most dissimilar variable in each cell
+
+most_dissimilar <- which.min(occs_mess)
+levels(most_dissimilar) <- data.frame(id = seq_along(mess_vars), var = mess_vars)
+
+# Mask cells which are already similar
+
+most_dissimilar_masked <- mask(most_dissimilar, occs_mess[["mess"]] < 0, maskvalues = FALSE)
+
+# Plot
+
+plot(most_dissimilar_masked, 
+     col = hcl.colors(length(mess_vars), "Set 2"),
+     main = "Most dissimilar variable (MESS < 0)")
+plot(study_area_vect, add = TRUE, lwd = .5)
+```
+
+Interestingly, different variables drive dissimilarity in different areas.
+
+```{r}
+plot(occs_mess, col = colours, breaks = breaks)
+```
+
+Bio_15 is basically always positive, so may not have much predictive power. This tracks with it rarely being the most dissimilar variable.
+
+# THE REST
 
 ### Download future climate projections
 
