@@ -24,7 +24,7 @@
 
 - [ ] Maps and summary statistics
 
-## Notes from 17/9 - meeting with Tessa
+## 2026-09-17 Meeting with Tessa
 
 - Population analysis was done using data from 1600 m, as well as below 1600 m in the ACT
 
@@ -53,3 +53,10 @@
   - Aim to be done by end of September
 
   - Get a review done by mid-October
+
+## 2026-16-10 Project review tasks
+
+- [x] Describe the default galah filters
+- [ ] Consider jittering points inside spatial bound when running model
+- [ ] Should there be a cut-off for observation dates?
+- [ ] Still haven't looked into the transects

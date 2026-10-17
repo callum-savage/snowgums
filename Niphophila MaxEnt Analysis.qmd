@@ -55,38 +55,47 @@ galah_config(
 # Set some default mapview parameters
 
 mapviewOptions(
-  basemaps = c("Esri.WorldImagery", "Esri.WorldTopoMap", "Esri.NatGeoWorldMap"),
-  legend = FALSE
+  basemaps = c("Esri.WorldTopoMap", "Esri.WorldImagery", "Esri.NatGeoWorldMap"),
+  legend = FALSE,
+  cex = 4,
+  alpha = 0.2
 )
 
 # Choose a random number seed so results are reproducible
 
 set.seed(4444)
+
+# Specify the geographic and projected CRSs used throughout this project
+
+crs_geog <- 4326 # WGS 84
+crs_proj <- 7855 # GDA2020 / MGA zone 55 (144°E–150°E)
 ```
 
 ## Data preparation
 
 ### Download the occurrence data
 
-The first thing I'll do is import the *E. niphophila* observational data. I'm using the `galah` package, which accesses data compiled by the Atlas of Living Australia (ALA).
+The first thing I'll do is import the *E. niphophila* observational data. I'm using the `galah` package, which lets me access all of the data compiled by the Atlas of Living Australia (ALA). Observations come from a number of sources such as government agencies, herbaria, and individuals.
 
-This download comes with a bunch of data quality checks which we can use to exclude low quality observations from the training data.
+I'm going to download just about every column that could possibly be of use, including a bunch of built-in data quality checks which we can use to exclude low quality observations from the training data.
 
-Descriptions of the environmental variables: <https://biocache.ala.org.au/fields?filter=name%3Ael%5B0-9%5D*&max=100&order=DESC&sort=classs>
+- [Descriptions of the data quality variables](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki)
 
-Descriptions of the data quality variables: <https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki>
+- [Descriptions of the environmental variables](https://biocache.ala.org.au/fields?filter=name%3Ael%5B0-9%5D*&max=100&order=DESC&sort=classs)
 
 ```{r}
 # If niph_raw has already been downloaded, import it. Otherwise, download observations from
-# the Atlas of Living Australia, including many metadata columns.
+# the Atlas of Living Australia, including >100 metadata columns.
 
 niph_raw_path <- here::here("data/galah/niph_raw.rds")
 
 if (file.exists(niph_raw_path)) {
+  
   niph_raw <- readr::read_rds(niph_raw_path)
+  
 } else {
   
-  # Construct an API call to galah
+  # Construct an API call to galah. Some columns can be accessed in predefined groups
   
   niph_raw_call <- galah_call() |>
     identify("Eucalyptus pauciflora subsp. niphophila") |>
@@ -118,29 +127,31 @@ if (file.exists(niph_raw_path)) {
   write_rds(niph_raw, niph_raw_path)
 }
 
-nrow(niph_raw)
+cat("Number of unfiltered Niphophila observations: ", nrow(niph_raw))
 ```
 
 ### Filter out low-quality data
 
-Not all of this data is super high quality, so we can apply some data quality filters to try and filter out unreliable records.
+Not all of this data is super high quality, so we can apply some data quality filters to try and filter out unreliable records. I'm basing this on the data quality filters ALA suggests for species distribution modelling, along with some additional data quality checks.
 
 The most important data quality filters are
 
-- [`spatiallyValid`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/spatiallyValid)`== TRUE`: Built-in checks to make sure the coordinates are logically consistent
+- [`spatiallyValid`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/spatiallyValid)`== TRUE`: Built-in checks to make sure the coordinates are valid and logically consistent
 
-- `is.na(isDuplicateOf)`: The record hasn't been flagged as a duplicate
+- [`is.na(isDuplicateOf)`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/isDuplicateOf): The record hasn't been flagged by ALA as a duplicate
 
-- [`outlierLayerCount`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/outlierLayerCount)`== 0`: The record isn't an outlier when compared with other environmental data.
+- [`outlierLayerCount`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/outlierLayerCount)`== 0`: The record hasn't been flagged by ALA as an outlier when compared with other environmental data.
 
 - [`coordinateUncertaintyInMeters`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/coordinate_uncertainty)`<= 1000`: Estimated coordinate uncertainty is less than 1 km. Records with no uncertainty estimate are removed as well.
 
 - I'm also removing records from before 1970, or which aren't in NSW, ACT, or Victoria.
 
 ```{r}
+# Apply data quality checks
+
 niph_raw_filtered <- niph_raw |> 
   filter(
-    occurrenceStatus == "PRESENT", # Not actually necissary, but reassuring
+    occurrenceStatus == "PRESENT", # Not actually necessary, but reassuring
     !is.na(decimalLongitude), 
     !is.na(decimalLatitude),
     coordinateUncertaintyInMeters <= 1000,
@@ -152,7 +163,7 @@ niph_raw_filtered <- niph_raw |>
     stateProvince %in% c("Victoria", "Australian Capital Territory", "New South Wales")
   )
 
-# Select a useful subset of columns to use in the rest of the analysis
+# Select a more readable subset of columns to use in the rest of the analysis
 
 niph_filtered <- niph_raw_filtered |>
   select(
@@ -176,10 +187,12 @@ niph_filtered <- niph_raw_filtered |>
 niph_filtered_sf <- st_as_sf(
   niph_filtered, 
   coords = c("decimalLongitude", "decimalLatitude"), 
-  crs = 4326
+  crs = crs_geog
 )
 
-mapview(niph_raw_filtered_sf)
+# View the records in an interactive map
+
+mapview(niph_filtered_sf)
 ```
 
 ### Targeted outlier removal
@@ -208,7 +221,9 @@ niph_notsus_sf <- niph_filtered_sf |>
     recordID %notin% suspicious_records
   )
 
-mapview(filter(niph_filtered_sf, recordID %in% suspicious_records))
+niph_filtered_sf |> 
+  mutate(suspicious = recordID %in% suspicious_records) |> 
+  mapview(zcol = "suspicious")
 ```
 
 ### Check the elevations
@@ -218,11 +233,10 @@ mapview(filter(niph_filtered_sf, recordID %in% suspicious_records))
 ```{r}
 # Download a 5 degree tile of 3s elevation data which covers the observations.
 # 3s data is on a grid of around 90 m x 90 m, which is more accurate than most of our data.
-# The crs is EPSG:4326
 
 elev_3s <- geodata::elevation_3s(lon = 147.5, lat = -37.5, path = here::here("data"))
 
-# Convert our observations to SpatVector for terra
+# Convert our observations to SpatVector to work with the terra package
 
 niph_vect <- vect(niph_notsus_sf)
 
@@ -255,16 +269,16 @@ niph_elev_sf <- niph_notsus_sf |>
 niph_elev_filter_sf <- niph_elev_sf |> 
   filter(elevation_m >= 1400)
 
-# Have a look at observations at an eleveation below 1400 m
+# Have a look at the observations we just filtered out
 
 niph_elev_sf |> 
   mutate(below_alt = elevation_m < 1400) |> 
-  mapview(zcol = "below_alt")
+  mapview(zcol = "below_alt", alpha.regions = 0.8)
 ```
 
 ### Australian Alps bioregion
 
-The Australian Alps bioregion will be key in defining our study area. I'll also use it to exclude any final records which might not be where we expect to find *Niphophila*.
+The Australian Alps bioregion will form the foundation of our study area definition. I'll also use it to exclude any final records which might not be where we expect to find *Niphophila*.
 
 ```{r}
 # The bioregions geodatabase doesn't download automatically. If needed, download it from
@@ -288,33 +302,68 @@ mapview(aus_alps, alpha.regions = 0.5, lwd = 2, alpha = 1) +
   mapview(niph_outside_aus_alps, col.regions = "red")
 ```
 
-There are three observations outside the bioregion. They're all clustered around Thredbo and only a few hundred metres outside the region. As they're so close to the bioregion I'm inclined to keep them in the data set - the positional uncertainty in both the point data and the bioregion definition mean that excluding them would be arbitrary.
-
-This means we now have our final observations data set.
+There are three observations outside the bioregion, all clustered around Thredbo and all very close to the region. Let's look see exactly how far they are from the bioregon.
 
 ```{r}
-niph <- niph_1400_sf
-
-niph
+niph_outside_aus_alps |>
+  as_tibble() |> 
+  mutate(dist_to_bioregion = st_distance(niph_outside_aus_alps, aus_alps)[, 1]) |> 
+  select(
+    dist_to_bioregion,
+    coordinateUncertaintyInMeters, 
+    elevation_m,
+    elevation_m_min,
+    elevation_m_max
+  )
 ```
 
-## Notes:
-
-- The CDSM filter of records might be a bit aggressive, so there are probably more records we can use. I'm also not really sure what rationale it's using to filter out records.
-
-- Should there be a date cut-off for observations? Some of them are 50+ years old which isn't exactly present conditions.
-
-- I should also look at the location uncertainty for each observation - DONE
-
-- There are some weird horizontal lines of records in NSW. I think they might be transects, but they could also be observations with rounded latitude. it's probably worth checking. And even if they are transects, they may still be skewing the results.
-
-- I'm not sure about filtering out records below 1300m. It removes some clear data quality issues, but it's probably a bit simplistic.
-
-- Data points can also be excluded based on known range - i.e. niphophila unlikely to be on Baw Baw
+Okay, so they're all within 100 m of the bioregion, which is within the bounds of their positional uncertainty. As there is also some inaccuracy in the bioregion definition I'm inclined to keep them in the data set - excluding them would be arbitrary.
 
 ## Define the study area
 
 We can define a plausible habitat area using a combination of the Australian Alps bioregion and elevation data.
+
+Let's have a look at the elevations in the Australian Alps bioregion.
+
+```{r}
+aus_alps_elev <- elev_3s |>
+  crop(vect(aus_alps)) |>
+  mask(vect(aus_alps))
+
+hist(aus_alps_elev, breaks = 50, maxcell = ncell(aus_alps_elev))
+```
+
+Okay, so there are quite a few cells where the elevation in the bioregion is well below our 1400 m limit. We can refine our study area by removing these areas.
+
+```{r}
+study_area <- aus_alps_1400 <- ifel(aus_alps_elev >= 1400, 1, NA) |> 
+  as.polygons() |> 
+  st_as_sf() |> 
+  st_transform(7855) |>  # GDA2020 / MGA Zone 55
+  smoothr::drop_crumbs(units::set_units(0.5, km^2)) |> 
+  smoothr::fill_holes(units::set_units(1, km^2)) |> 
+  smoothr::smooth(method = "ksmooth", smoothness = 2) |> 
+  #st_buffer(300) |> 
+  st_transform(4326)
+
+# Check to see if any points have fallen outside
+outside <- niph |> 
+  st_transform(7855) |> 
+  st_filter(study_area, .predicate = st_disjoint)
+
+# Plot just the points outside the bioregion
+
+mapview(study_area, alpha.regions = 0.5, lwd = 2, alpha = 1) +
+  mapview(niph, col.regions = "red")
+```
+
+```{r}
+study_area_elev <- elev_3s |>
+  crop(vect(study_area)) |>
+  mask(vect(study_area))
+
+hist(study_area_elev, breaks = 50, maxcell = ncell(study_area_elev))
+```
 
 ```{r}
 # Import IBRA Bioregions Version 7.1, and select the Australian Alps bioregion
@@ -348,7 +397,7 @@ study_area <- elev_mask |>
 #   smooth(method = "ksmooth", smoothness = 3)
 
 mapview(study_area, alpha.regions = 0.5, lwd = 2, alpha = 1) +
-  mapview(niph_elev, col.regions = "purple")
+  mapview(niph, col.regions = "purple")
 
 # This study area is very jagged. Maybe I should just be using the bioregion? Also, there are still some points which sit outside of this region
 ```
