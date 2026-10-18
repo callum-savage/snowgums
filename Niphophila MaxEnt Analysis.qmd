@@ -32,22 +32,23 @@ This section contains package imports.
 #| message: false
 #| warning: false
 
-library(dplyr)     # Data wrangiling
-library(tidyr)     # Moving data between tall and wide formats
-library(readr)     # In/out tabular data
-library(purrr)     # Functional programming tools
-library(ggplot2)   # Plotting
-library(sf)        # Vector data tools
-library(terra)     # Raster data tools
-library(mapview)   # Quick interactive maps
-library(galah)     # Access species occurrence data (Atlas of Living Australia)
-#library(geodata)   # Access climate data, including projections
-#library(maxnet)    # Maxent species distribution modeling
-#library(ENMeval)   # Tune echological niche models
+library(dplyr)       # Data wrangling
+library(tidyr)       # Moving data between tall and wide formats
+#library(readr)      # In/out tabular data
+library(purrr)       # Functional programming tools
+library(ggplot2)     # Plotting
+library(sf)          # Vector data tools
+library(terra)       # Raster data tools
+library(mapview)     # Quick interactive maps
+library(galah)       # Access species occurrence data (Atlas of Living Australia)
+#library(geodata)    # Access climate data, including projections
+#library(maxnet)     # Maxent species distribution modeling
+#library(ENMeval)    # Tune ecological niche models
+library(conflicted)  # Manage package conflicts
 
 # Also used via pkg::fun():
 # conflicted, corrplot, geodata, smoothr, spThin, predicts,
-# ggrepel, here, units, readr
+# ggrepel, here, units, readr, usdm
 
 conflicted::conflict_prefer("extract", "terra")
 conflicted::conflict_prefer("filter", "dplyr")
@@ -56,7 +57,7 @@ conflicted::conflict_prefer("filter", "dplyr")
 Some packages also require some configuration.
 
 ```{r}
-# An email (attached to an account) is required for galah requiests
+# An email (attached to an account) is required for galah requests
 # If you're adapting this code please don't use my email
 
 galah::galah_config(
@@ -165,7 +166,7 @@ The most important data quality filters are
 
 - [`coordinateUncertaintyInMeters`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/coordinate_uncertainty)`<= 1000`: Estimated coordinate uncertainty is less than 1 km. Records with no uncertainty estimate are removed as well.
 
-- I'm also removing records from before 1970, or which aren't in NSW, ACT, or Victoria.
+- I'm also removing records from before 1970 to match the baseline of our climate data, as well as any records which aren't in NSW, ACT, or Victoria.
 
 ```{r}
 # Apply data quality checks
@@ -239,7 +240,7 @@ suspicious_records <- c(
 
 niph_notsus_sf <- niph_filtered_sf |> 
   filter(
-    recordID %notin% suspicious_records
+    !(recordID %in% suspicious_records)
   )
 
 niph_filtered_sf |> 
@@ -249,9 +250,7 @@ niph_filtered_sf |>
 
 ### Check the elevations
 
-*Niphophila* is known to inhabit altitudes above 1600 m. To allow for some natural variation we'll allow records down to 1400 m, but any records below this altitude will be removed as they have a higher likelihood of being misidentifications.
-
-1400 m is a bit arbitrary and could plausibly be moved up or downwards.
+*E. niphophila* is known to inhabit altitudes above 1600 m (expert advice). To allow for some natural variation we'll allow records down to 1400 m, but any records below this altitude will be removed as they have a higher likelihood of being mis-identifications.
 
 ```{r}
 # Download a 5 degree tile of 3s elevation data which covers the observations.
@@ -261,30 +260,31 @@ elev_3s <- geodata::elevation_3s(lon = 147.5, lat = -37.5, path = here::here("da
 
 # Convert our observations to SpatVector to work with the terra package
 
-niph_vect <- vect(niph_notsus_sf)
+niph_notsus_vect <- vect(niph_notsus_sf)
 
 # Extract the elevation at each point
 
-niph_elevs <- extract(elev_3s, niph_vect)
+niph_elevs <- extract(elev_3s, niph_notsus_vect)
 
 # Construct a buffer around each observation to account for positional uncertainty
 
 niph_buffers <- buffer(
-  niph_vect, 
+  niph_notsus_vect, 
   width = niph_notsus_sf$coordinateUncertaintyInMeters
 )
 
 # Extract the maximum and minimum elevations in each buffer zone
 
-niph_elev_ranges <- extract(elev_3s, niph_buffers, fun = range, na.rm = TRUE)
+niph_elev_min <- extract(elev_3s, niph_buffers, fun = min, na.rm = TRUE)
+niph_elev_max <- extract(elev_3s, niph_buffers, fun = max, na.rm = TRUE)
 
 # Join the extracted elevation data back to our raw data set
 
 niph_elev_sf <- niph_notsus_sf |>
   mutate(
     elevation_m = niph_elevs[[2]],
-    elevation_m_min = niph_elev_ranges[, 2],
-    elevation_m_max = niph_elev_ranges[, 3]
+    elevation_m_min = niph_elev_min[[2]],
+    elevation_m_max =niph_elev_max[[2]]
   )
 
 # Filter out records below 1400 m
@@ -299,9 +299,11 @@ niph_elev_sf |>
   mapview(zcol = "below_alt", alpha.regions = 0.8)
 ```
 
+I extracted the minimum and maximum elevation within the radius of coordinate uncertainty for each point. Debectably we could filter our observations based on the maximum possible elevation within this radius. However I ultimately decided to filter based on the elevation at the point, as the 1400 m threshold is likely to be generous already.
+
 ### Australian Alps bioregion
 
-The Australian Alps bioregion will form the foundation of our study area definition. I'll also use it to exclude any final records which might not be where we expect to find *Niphophila*.
+The Australian Alps bioregion will form the foundation of our study area definition. I'll also use it to exclude any final records which might not be where we expect to find *E. niphophila*.
 
 ```{r}
 # The bioregions geodatabase doesn't download automatically. If needed, download it from
@@ -358,7 +360,7 @@ niph |>
   labs(x = "Year", y = "Records", title = "Observations by year")
 ```
 
-It looks like there was a spike in observations in 1990 - I assume this is due to a specific survey but it's worth checking.
+It looks like there was a spike in observations in 1999 - I assume this is due to a specific survey but it's worth checking.
 
 ```{r}
 niph_sf |> 
@@ -448,10 +450,10 @@ aus_alps_parts <- st_sf(geometry = aus_alps_proj) |>
   mutate(keep = within_dist)
 
 mapview(aus_alps_parts, zcol = "keep") +
-  mapview(niph_proj, col.regions = "purple")
+  mapview(niph_proj, col.regions = "red")
 ```
 
-In the above map the purple regions will be removed from the study area.
+In the above map the purple regions will be removed from the study area. This includes large areas around Baw Baw, Lake Mountain, and Mount Skene. These areas are well frequented, so *E. Niphophila* would have very likely been observed if it grew in these regions. The polygons removed further north tend to be small and peripheral or lower altitude.
 
 To finish creating the study area I'll add a small buffer around the remaining polygons. This accounts for uncertainty in the bioregion definition.
 
@@ -569,7 +571,7 @@ corrplot::corrplot(
   method = "circle", 
   type = "upper",
   tl.col = "black"
-  )
+)
 ```
 
 To deal with this, we can refine our variables down into a more meaningful set of predictors.
@@ -598,8 +600,6 @@ clim_candidates <- clim[[setdiff(names(clim), interactive_vars)]]
 vif_threshold <- 10
 
 vif_exclusions <- usdm::vifstep(clim_candidates, th = vif_threshold) 
-
-#clim_selected <- usdm::exclude(clim_candidates, vif_exclusions)
 
 vif_exclusions
 ```
@@ -635,6 +635,8 @@ mess_area <- crop(clim_tile[[clim_vars]], ext(145.5, 152, -38, -35))
 
 # Extract the climatic variables at each observation
 
+niph_vect <- vect(niph_sf)
+
 occs_z <- terra::extract(mess_area, niph_vect, ID = FALSE) |>
   drop_na()
 
@@ -654,7 +656,7 @@ And another version where the similarity has been binned so it's a bit easier to
 # Define breaks and colours
 
 breaks <- c(-Inf, -50, -20, -10, 0, 10, 20, 50, 100)
-colours <- hcl.colors(length(brks) - 1, "RdBu")
+colours <- hcl.colors(length(breaks) - 1, "RdBu")
 
 plot(occs_mess[["mess"]], breaks = breaks, col = colours, main = "Environmental similarity")
 plot(study_area_vect, border = "black", lwd = 1, add = TRUE)
@@ -667,21 +669,21 @@ Let's actually calculate how much of the study area is dissimilar.
 ```{r}
 # Extract the MESS values in the study area
 
-stud_area_mess <- mask(crop(occs_mess, study_area_vect), study_area_vect)
+study_area_mess <- mask(crop(occs_mess, study_area_vect), study_area_vect)
 
 # Find the proporation of negative MESS values
 
-100 * global(sa_mess < 0, "mean", na.rm = TRUE)[[1]]
+100 * global(study_area_mess[["mess"]] < 0, "mean", na.rm = TRUE)[[1]]
 ```
 
-14% of our study area is dissimilar to our observations. Acceptable.
+Almost 50% of our study area is dissimilar to our observations.
 
 We can also see which variables are driving the dissimilarity.
 
 ```{r}
 # Find the index of the most dissimilar variable in each cell
 
-most_dissimilar <- which.min(occs_mess)
+most_dissimilar <- which.min(occs_mess[[paste0(clim_vars, "_mess")]])
 levels(most_dissimilar) <- data.frame(id = seq_along(clim_vars), var = clim_vars)
 
 # Mask cells which are already similar
@@ -696,7 +698,7 @@ plot(most_dissimilar_masked,
 plot(study_area_vect, add = TRUE, lwd = .5)
 ```
 
-Interestingly, different variables drive dissimilarity in different areas. bio_15 is the only variable that isn't showing up much in this map.
+Interestingly, different variables drive dissimilarity in different areas. bio_15 is the only variable that isn't showing up much in this map and might be a candidate for removal.
 
 ```{r}
 plot(occs_mess, col = colours, breaks = breaks)
@@ -704,7 +706,7 @@ plot(occs_mess, col = colours, breaks = breaks)
 
 Bio_15 is basically always positive, so may not have much predictive power. This tracks with it rarely being the most dissimilar variable.
 
-## Thining observational data
+## Thinning observational data
 
 Our observations are biased towards where people look (i.e. along roads) rather than how *Niphophila* are actually distributed. Some observations are also clustered closely together, and if we included all of them certain environments would be overrepresented.
 
@@ -783,8 +785,7 @@ bin_edges <- clim_vars |>
 
 # Extract the values of each variable at our transect points
 
-transect_clim <- niph_sf |>
-  filter(transect) |> 
+transect_clim <- niph_transects |>
   bind_cols(terra::extract(clim_selected, vect(niph_transects), ID = FALSE))
 
 # Define a function to assign each value to a bin number
@@ -801,7 +802,8 @@ transect_thinned <- transect_clim |>
                 .names = "{.col}_bin")) |>
   group_by(across(ends_with("_bin"))) |>
   slice_sample(n = 1) |>
-  ungroup()
+  ungroup() |> 
+  mutate(transect = TRUE)
 
 # Update our data set
 
@@ -849,4 +851,4 @@ niph_trans_thinned |>
 
 The majority of records which were removed are clustered around high-traffic areas like Hotham Heights or Charlotte Pass. This is what we wanted as these areas are overrepresented in our observation data. It should be noted that no environmental data was actually lost in this step - the model would only use one observation per grid cell anyway.
 
-We could consider doing another round of thinning based on the actual distances between obsrvations using `spThin`. This would further reduce the sampling bias, however it would also risk losing environmental data. I'll leave it here for now.
+We could consider doing another round of thinning based on the actual distances between observations using `spThin`. This would further reduce the sampling bias, however it would also risk losing environmental data. I'll leave it here for now.
