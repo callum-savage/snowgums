@@ -44,8 +44,7 @@ library(mapview)     # Quick interactive maps
 library(galah)       # Access species occurrence data (Atlas of Living Australia)
 library(conflicted)  # Manage package conflicts
 
-conflicted::conflict_prefer("extract", "terra")
-conflicted::conflict_prefer("filter", "dplyr")
+conflicts_prefer(dplyr::filter, terra::extract, galah::identify, terra::extract)
 ```
 
 Some packages also require some configuration.
@@ -163,9 +162,10 @@ The most important data quality filters are
 - I'm also removing records from before 1970 to match the baseline of our climate data, as well as any records which aren't in NSW, ACT, or Victoria.
 
 ```{r}
-# Apply data quality checks
-
-niph_raw_filtered <- niph_raw |> 
+niph <- niph_raw |> 
+  
+  # Apply data quality checks
+  
   filter(
     occurrenceStatus == "PRESENT", # Not actually necessary, but reassuring
     !is.na(decimalLongitude), 
@@ -177,11 +177,10 @@ niph_raw_filtered <- niph_raw |>
     year >= 1970,
     country == "Australia",
     stateProvince %in% c("Victoria", "Australian Capital Territory", "New South Wales")
-  )
-
-# Select a more readable subset of columns to use in the rest of the analysis
-
-niph_filtered <- niph_raw_filtered |>
+  ) |> 
+  
+  # Column selection
+  
   select(
     "recordID",
     "scientificName",
@@ -196,49 +195,54 @@ niph_filtered <- niph_raw_filtered |>
     "stateProvince",
     "dataResourceName",
     "institutionCode"
-  )
+  ) |> 
+  
+  # Convert to a simple features object, i.e. explicitly spatial
+  
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = crs_geog) |> 
+  
+  # Creaet an empty column to keep track of exclusions
+  
+  mutate(excluded = NA_character_)
 
-# Convert the observations into a spatial object
+# Define a helper function for flaging excluded records
 
-niph_filtered_sf <- st_as_sf(
-  niph_filtered, 
-  coords = c("decimalLongitude", "decimalLatitude"), 
-  crs = crs_geog
-)
+flag <- function(excluded, condition, reason) {
+  coalesce(excluded, if_else(condition, reason, NA))
+}
 
 # View the records in an interactive map
 
-mapview(niph_filtered_sf)
+mapview(niph)
 ```
 
 ### Targeted outlier removal
 
-Some observations are still suspicious, despite passing the data quality checks. I'll remove these records explicitly.
+Some observations are still suspicious, despite passing the data quality checks. I'll remove these records manually.
 
-+--------------------------------------+-----------------------------------------------------------------------------------------+
-| **recordID**                         | **Reason for removal**                                                                  |
-+======================================+=========================================================================================+
-| 2c4dd780-74ef-4337-893b-250e47aa64a8 | In Grampians NP, well outside known range                                               |
-+--------------------------------------+-----------------------------------------------------------------------------------------+
-| f1047be9-66f7-4ba6-9157-d0f1d906fa12 | In Baw Baw NP and from 1994, so likely to be the Baw Baw subspecies (described in 1994) |
-|                                      |                                                                                         |
-| 56c4cb9d-db98-4f0c-8080-d75a281a5b06 |                                                                                         |
-+--------------------------------------+-----------------------------------------------------------------------------------------+
+- One observation in Grampians NP which is outside the known range
+
+- Two observations in Baw Baw which are from 1994 and are likely to be misidentifications of the Baw Baw subspecies (which was only described in 1994).
 
 ```{r}
-suspicious_records <- c(
-  "2c4dd780-74ef-4337-893b-250e47aa64a8",
-  "f1047be9-66f7-4ba6-9157-d0f1d906fa12",
-  "56c4cb9d-db98-4f0c-8080-d75a281a5b06"
-)
+# Identify suspicous records
 
-niph_notsus_sf <- niph_filtered_sf |> 
-  filter(
-    !(recordID %in% suspicious_records)
+suspicious <- c(
+    "2c4dd780-74ef-4337-893b-250e47aa64a8" = "In Grampians NP, outside known range",
+    "f1047be9-66f7-4ba6-9157-d0f1d906fa12" = "In Baw Baw, likely different subspecies",
+    "56c4cb9d-db98-4f0c-8080-d75a281a5b06" = "In Baw Baw, likely different subspecies"
+  ) |>
+  tibble::enframe(name = "recordID", value = "reason")
+
+# Flag these observations for exclusion
+
+niph <- niph |> 
+  mutate(
+    excluded = flag(excluded, recordID %in% suspicious$recordID, "suspicious")
   )
 
-niph_filtered_sf |> 
-  mutate(suspicious = recordID %in% suspicious_records) |> 
+niph |> 
+  mutate(suspicious = excluded %in% "suspicious") |>
   mapview(zcol = "suspicious")
 ```
 
@@ -252,19 +256,15 @@ niph_filtered_sf |>
 
 elev_3s <- geodata::elevation_3s(lon = 147.5, lat = -37.5, path = here::here("data"))
 
-# Convert our observations to SpatVector to work with the terra package
-
-niph_notsus_vect <- vect(niph_notsus_sf)
-
 # Extract the elevation at each point
 
-niph_elevs <- extract(elev_3s, niph_notsus_vect)
+niph_elevs <- extract(elev_3s, vect(niph))
 
 # Construct a buffer around each observation to account for positional uncertainty
 
 niph_buffers <- buffer(
-  niph_notsus_vect, 
-  width = niph_notsus_sf$coordinateUncertaintyInMeters
+  vect(niph), 
+  width = niph$coordinateUncertaintyInMeters
 )
 
 # Extract the maximum and minimum elevations in each buffer zone
@@ -274,26 +274,27 @@ niph_elev_max <- extract(elev_3s, niph_buffers, fun = max, na.rm = TRUE)
 
 # Join the extracted elevation data back to our raw data set
 
-niph_elev_sf <- niph_notsus_sf |>
+niph <- niph |>
   mutate(
     elevation_m = niph_elevs[[2]],
     elevation_m_min = niph_elev_min[[2]],
-    elevation_m_max =niph_elev_max[[2]]
+    elevation_m_max =niph_elev_max[[2]],
+    .after = coordinateUncertaintyInMeters
   )
 
-# Filter out records below 1400 m
+# Flag records below the elevation threshold
 
-niph_elev_filter_sf <- niph_elev_sf |> 
-  filter(elevation_m >= 1400)
+niph <- niph |>
+  mutate(excluded = flag(excluded, elevation_m < 1400, "below elevation"))
 
 # Have a look at the observations we just filtered out
 
-niph_elev_sf |> 
-  mutate(below_alt = elevation_m < 1400) |> 
-  mapview(zcol = "below_alt", alpha.regions = 0.8)
+niph |> 
+  mutate(below_elevation = excluded %in% "below elevation") |> 
+  mapview(zcol = "below_elevation", alpha.regions = 0.8)
 ```
 
-I extracted the minimum and maximum elevation within the radius of coordinate uncertainty for each point. Debectably we could filter our observations based on the maximum possible elevation within this radius. However I ultimately decided to filter based on the elevation at the point, as the 1400 m threshold is likely to be generous already.
+I extracted the minimum and maximum elevation within the radius of coordinate uncertainty for each point. Debatably we could filter our observations based on the maximum possible elevation within this radius. However I ultimately decided to filter based on the elevation at the point, as the 1400 m threshold is likely to be generous already.
 
 ### Australian Alps bioregion
 
@@ -307,12 +308,13 @@ The Australian Alps bioregion will form the foundation of our study area definit
 
 aus_alps <- st_read(here::here("data/IBRA7_regions.gdb")) |>
   filter(REG_NAME_7 == "Australian Alps") |> 
-  st_transform(4326) |> 
+  st_transform(crs_geog) |> 
   st_union()
 
 # Identify any observations outside the bioregion
 
-niph_outside_aus_alps <- niph_elev_filter_sf |> 
+niph_outside_aus_alps <- niph |> 
+  filter(is.na(excluded)) |> 
   st_filter(aus_alps, .predicate = st_disjoint)
 
 # Plot just the points outside the bioregion
@@ -341,14 +343,8 @@ Okay, so they're all within 100 m of the bioregion, which is within the bounds o
 ### Inspect our observational data
 
 ```{r}
-niph_sf <- niph_elev_filter_sf
-niph <- as_tibble(niph_sf)
-
-niph
-```
-
-```{r}
 niph |> 
+  filter(is.na(excluded)) |> 
   ggplot(aes(x = year)) +
   geom_bar() +
   labs(x = "Year", y = "Records", title = "Observations by year")
@@ -357,7 +353,8 @@ niph |>
 It looks like there was a spike in observations in 1999 - I assume this is due to a specific survey but it's worth checking.
 
 ```{r}
-niph_sf |> 
+niph |> 
+  filter(is.na(excluded)) |> 
   filter(year == 1999) |> 
   mapview()
 ```
@@ -366,6 +363,7 @@ Yeah, so 1999 is the year of those transects. It is possible that those records 
 
 ```{r}
 niph |>
+  filter(is.na(excluded)) |> 
   ggplot(aes(forcats::fct_infreq(basisOfRecord))) +
   geom_bar() +
   geom_text(aes(label = after_stat(count)), stat = "count", hjust = -0.2) +
@@ -378,6 +376,7 @@ Most of our observations are human observations which is great. The single recor
 
 ```{r}
 niph |>
+  filter(is.na(excluded)) |> 
   ggplot(aes(elevation_m)) +
   geom_histogram(binwidth = 25, boundary = 1400) +
   geom_vline(xintercept = 1400, linetype = "dashed") +
@@ -388,6 +387,7 @@ This looks roughly like what we'd expect. Most observations are below 1800, thou
 
 ```{r}
 niph |>
+  filter(is.na(excluded)) |> 
   ggplot(aes(coordinateUncertaintyInMeters)) +
   geom_histogram(binwidth = 50, boundary = 0) +
   geom_vline(xintercept = 1000, linetype = "dashed") +
@@ -397,25 +397,40 @@ niph |>
 Interesting, it looks like the majority of our records are actually more accurate than I was giving them credit for. The spikes at 500 m and 1000 m would have been set manually. It could actually be worth considering if a stricter coordinate uncertainty limit would be worthwhile, given we'd be losing relatively few points.
 
 ```{r}
-count(niph, stateProvince) |> print()
+niph |> 
+  filter(is.na(excluded)) |> 
+  st_drop_geometry() |> 
+  count(stateProvince)
 ```
 
 NSW seems to quite heavily weighted in our data. I think that's primarily because there have been some systematic transects in the NSW Alps.
 
 ```{r}
-count(niph, dataResourceName) |> arrange(-n) |> print()
+niph |> 
+  filter(is.na(excluded)) |> 
+  st_drop_geometry() |> 
+  count(dataResourceName) |> 
+  arrange(-n)
 ```
 
 NSW BioNet Atlas being the largest data source tracks with the high occurrence of NSW data points.
 
 ```{r}
-count(niph, institutionCode) |> arrange(-n) |> print()
+niph |> 
+  filter(is.na(excluded)) |> 
+  st_drop_geometry() |> 
+  count(institutionCode) |> 
+  arrange(-n)
 ```
 
 DCCEEW and iNaturalist together provide most of our data.
 
 ```{r}
-count(niph, identifiedBy) |> arrange(-n) |> print()
+niph |> 
+  filter(is.na(excluded)) |> 
+  st_drop_geometry() |> 
+  count(identifiedBy) |> 
+  arrange(-n)
 ```
 
 Thanks jackiemiles.
@@ -429,19 +444,17 @@ I'll be basing the study area on the Australian Alps bioregion. All of our obser
 ```{r}
 # To look at distances between points we need to move to a projected CRS
 
-niph_proj <- niph_sf |> 
+niph_proj <- niph |>
+  filter(is.na(excluded)) |>
   st_transform(crs_proj)
 
-aus_alps_proj <- aus_alps |> 
-  st_transform(crs_proj) |> 
-  st_cast("POLYGON")
+# Keep polygons within 1000 m of an observation
 
-# Check if our points are within 1000 m of an observation
-
-within_dist <- lengths(st_is_within_distance(aus_alps_proj, niph_proj, dist = 1000)) > 0
-
-aus_alps_parts <- st_sf(geometry = aus_alps_proj) |> 
-  mutate(keep = within_dist)
+aus_alps_parts <- aus_alps |>
+  st_transform(crs_proj) |>
+  st_cast("POLYGON") |>
+  st_sf(geometry = _) |>
+  mutate(keep = lengths(st_is_within_distance(geometry, niph_proj, dist = 1000)) > 0)
 
 mapview(aus_alps_parts, zcol = "keep") +
   mapview(niph_proj, col.regions = "red")
@@ -465,7 +478,7 @@ study_area <- aus_alps_parts |>
   st_make_valid()
 
 mapview(study_area, alpha.regions = 0.3, lwd = 2, alpha = 1) +
-  mapview(niph_sf, col.regions = "purple")
+  mapview(filter(niph, is.na(excluded)), col.regions = "red")
 ```
 
 There are still parts of the study area which don't have any observations. Possibly these should be removed. Alternatively, multiple different study areas can be tested to see if it effects the output.
@@ -473,7 +486,9 @@ There are still parts of the study area which don't have any observations. Possi
 ```{r}
 # Double check that all observations are within the study area (expect 0 rows)
 
-st_filter(niph_sf, study_area, .predicate = st_disjoint) |> 
+niph |> 
+  filter(is.na(excluded)) |> 
+  st_filter(study_area, .predicate = st_disjoint) |> 
   nrow()
 ```
 
@@ -514,11 +529,9 @@ clim_tile <- geodata::worldclim_tile(
 # Crop the climate data to our study area, making sure that any grid cell 
 # that touches the study area is included
 
-study_area_vect <- vect(study_area)
-
 clim <- clim_tile |>
-  crop(study_area_vect, snap = "out") |>
-  mask(study_area_vect, touches = TRUE)
+  crop(vect(study_area), snap = "out") |>
+  mask(vect(study_area), touches = TRUE)
 
 # Create a key for interpreting the layer names
 
@@ -629,9 +642,7 @@ mess_area <- crop(clim_tile[[clim_vars]], ext(145.5, 152, -38, -35))
 
 # Extract the climatic variables at each observation
 
-niph_vect <- vect(niph_sf)
-
-occs_z <- terra::extract(mess_area, niph_vect, ID = FALSE) |>
+occs_z <- extract(mess_area, vect(filter(niph, is.na(excluded))), ID = FALSE) |>
   drop_na()
 
 # Get the MESS values across the full tile (not just the study area)
@@ -641,7 +652,7 @@ occs_mess <- predicts::mess(mess_area, occs_z, full = TRUE)
 # Construct a MESS plot, overlayed with our study area
 
 plot(occs_mess[["mess"]], col = hcl.colors(100, "RdBu"), main = "Environmental similarity")
-plot(study_area_vect, border = "black", lwd = 1, add = TRUE)
+plot(vect(study_area), border = "black", lwd = 1, add = TRUE)
 ```
 
 And another version where the similarity has been binned so it's a bit easier to interpret.
@@ -653,7 +664,7 @@ breaks <- c(-Inf, -50, -20, -10, 0, 10, 20, 50, 100)
 colours <- hcl.colors(length(breaks) - 1, "RdBu")
 
 plot(occs_mess[["mess"]], breaks = breaks, col = colours, main = "Environmental similarity")
-plot(study_area_vect, border = "black", lwd = 1, add = TRUE)
+plot(vect(study_area), border = "black", lwd = 1, add = TRUE)
 ```
 
 Okay, looking pretty good then. Our study area captures all of the core habitat areas and there aren't any areas with a highly similar environment outside of our study area. There are some large chunks of our study area that have close to zero similarity, however there's not much that's actually dissimilar.
@@ -663,7 +674,7 @@ Let's actually calculate how much of the study area is dissimilar.
 ```{r}
 # Extract the MESS values in the study area
 
-study_area_mess <- mask(crop(occs_mess, study_area_vect), study_area_vect)
+study_area_mess <- mask(crop(occs_mess, vect(study_area)), vect(study_area))
 
 # Find the proporation of negative MESS values
 
@@ -689,7 +700,7 @@ most_dissimilar_masked <- mask(most_dissimilar, occs_mess[["mess"]] < 0, maskval
 plot(most_dissimilar_masked, 
      col = hcl.colors(length(clim_vars), "Set 2"),
      main = "Most dissimilar variable (MESS < 0)")
-plot(study_area_vect, add = TRUE, lwd = .5)
+plot(vect(study_area), add = TRUE, lwd = .5)
 ```
 
 Interestingly, different variables drive dissimilarity in different areas. bio_15 is the only variable that isn't showing up much in this map and might be a candidate for removal.
@@ -731,18 +742,20 @@ transect_boxes <- transect_box_coords |>
 
 # Identify the transect records
 
-niph_transects <- niph_sf |> 
+niph_transects <- niph |> 
+  filter(is.na(excluded)) |> 
   filter(year == 1999, stateProvince == "New South Wales") |> 
-  st_filter(transect_boxes)
+  st_filter(transect_boxes) |> 
+  pull(recordID)
 
-# Flag transect records in niph_sf
+# Flag transect records
 
-niph_sf <- niph_sf |> 
-  mutate(transect = recordID %in% niph_transects$recordID)
+niph <- niph |> 
+  mutate(transect = recordID %in% niph_transects)
 
 # Visually confirm that everything is working
 
-niph_sf |> 
+niph |> 
   mapview(zcol = "transect") +
   mapview(transect_boxes, col.regions = "red")
 ```
@@ -754,7 +767,7 @@ Now we have to thin out the transect data. I'm going to do this using environmen
 First, let's see how many grid cells there are along our transects.
 
 ```{r}
-length(unique(cells(clim_selected[[1]], vect(niph_transects))[, "cell"]))
+length(unique(cells(clim_selected[[1]], vect(filter(niph, transect)))[, "cell"]))
 ```
 
 Okay, so at most we will be keeping 45 transect observations (observations within the same grid cell are the same for our purposes).
@@ -779,8 +792,12 @@ bin_edges <- clim_vars |>
 
 # Extract the values of each variable at our transect points
 
-transect_clim <- niph_transects |>
-  bind_cols(terra::extract(clim_selected, vect(niph_transects), ID = FALSE))
+transect_clim <- niph |>
+  filter(is.na(excluded)) |> 
+  filter(transect)
+
+transect_clim <- transect_clim |> 
+  bind_cols(terra::extract(clim_selected, vect(transect_clim), ID = FALSE))
 
 # Define a function to assign each value to a bin number
 
@@ -790,32 +807,34 @@ assign_bin <- function(x, edges) {
 
 # Keep one record per occupied combination of bins
 
-transect_thinned <- transect_clim |>
+niph_transect_thinned <- transect_clim |>
   mutate(across(all_of(clim_vars),
                 \(x) assign_bin(x, bin_edges[[cur_column()]]),
                 .names = "{.col}_bin")) |>
   group_by(across(ends_with("_bin"))) |>
   slice_sample(n = 1) |>
   ungroup() |> 
-  mutate(transect = TRUE)
+  pull(recordID)
 
-# Update our data set
+# Flag the thinned out records
 
-niph_trans_thinned <- bind_rows(
-  filter(niph_sf, !transect),
-  select(transect_thinned, all_of(names(niph_sf)))
-)
+niph <- niph |> 
+  mutate(excluded = flag(
+      excluded, 
+      transect & !(recordID %in% niph_transect_thinned), 
+      "transect thinning"
+    ))
 
-cat(nrow(transect_thinned), "/", nrow(niph_transects), "transect observations kept")
+cat(length(niph_transect_thinned), "/", length(niph_transects), "transect observations kept")
 ```
 
 We can also visualise the points which have been retained.
 
 ```{r}
-transect_status <- niph_transects |>
-  mutate(status = if_else(recordID %in% transect_thinned$recordID, "kept", "removed"))
-
-mapview(transect_status, zcol = "status", alpha.regions = 1)
+niph |>
+  filter(transect) |> 
+  mutate(status = if_else(recordID %in% niph_transect_thinned, "kept", "removed")) |> 
+  mapview(zcol = "status", alpha.regions = 1)
 ```
 
 ### Spatial thinning
@@ -827,20 +846,32 @@ I originally did this using the `spThin` package which basically removes records
 An alternative method is simpler. Group the observations by grid cell and keep the observation which has the lowest coordinate uncertainty. Recency is used as a tiebreaker.
 
 ```{r}
-niph_thinned <- niph_trans_thinned |>
-  mutate(cell = cells(clim[[1]], vect(niph_trans_thinned))[, "cell"]) |>
-  arrange(coordinateUncertaintyInMeters, desc(year)) |>
-  distinct(cell, .keep_all = TRUE)
+# Find the clmate grid cell of each record
 
-cat(nrow(niph_thinned), "/", nrow(niph_trans_thinned), "observations kept")
+niph$cell <- cells(clim[[1]], vect(niph))[, "cell"]
+
+# Keep the most precise (then most recent) record in each cell
+
+kept <- niph |>
+  filter(is.na(excluded)) |>
+  arrange(coordinateUncertaintyInMeters, desc(year)) |>
+  distinct(cell, .keep_all = TRUE) |>
+  pull(recordID)
+
+# Flag the excluded records
+
+niph <- niph |>
+  mutate(excluded = flag(excluded, !recordID %in% kept, "grid cell thinning"))
+
+cat(length(kept), "observations kept")
 ```
 
 And let's see what we removed.
 
 ```{r}
-niph_trans_thinned |> 
-  mutate(kept = recordID %in% niph_thinned$recordID) |> 
-  mapview(zcol = "kept")
+niph |> 
+  mutate(removed = excluded %in% "grid cell thinning") |> 
+  mapview(zcol = "removed")
 ```
 
 The majority of records which were removed are clustered around high-traffic areas like Hotham Heights or Charlotte Pass. This is what we wanted as these areas are overrepresented in our observation data. It should be noted that no environmental data was actually lost in this step - the model would only use one observation per grid cell anyway.
