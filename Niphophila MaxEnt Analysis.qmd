@@ -619,6 +619,8 @@ In this set bio_6 (minimum temperature of the coldest month) has been exchanged 
 ```{r}
 clim_selected <- usdm::exclude(clim_candidates, vif_exclusions2)
 
+clim_vars <- names(clim_selected)
+
 plot(clim_selected, main = bio_names[names(clim_selected)])
 ```
 
@@ -629,9 +631,7 @@ Let's see how the landscape varies with respect to the areas around our occurren
 ```{r}
 # We'll do the MESS analysis using our selected variables
 
-mess_vars <- names(clim_selected)
-
-mess_area <- crop(clim_tile[[mess_vars]], ext(145.5, 152, -38, -35))
+mess_area <- crop(clim_tile[[clim_vars]], ext(145.5, 152, -38, -35))
 
 # Extract the climatic variables at each observation
 
@@ -682,7 +682,7 @@ We can also see which variables are driving the dissimilarity.
 # Find the index of the most dissimilar variable in each cell
 
 most_dissimilar <- which.min(occs_mess)
-levels(most_dissimilar) <- data.frame(id = seq_along(mess_vars), var = mess_vars)
+levels(most_dissimilar) <- data.frame(id = seq_along(clim_vars), var = clim_vars)
 
 # Mask cells which are already similar
 
@@ -691,7 +691,7 @@ most_dissimilar_masked <- mask(most_dissimilar, occs_mess[["mess"]] < 0, maskval
 # Plot
 
 plot(most_dissimilar_masked, 
-     col = hcl.colors(length(mess_vars), "Set 2"),
+     col = hcl.colors(length(clim_vars), "Set 2"),
      main = "Most dissimilar variable (MESS < 0)")
 plot(study_area_vect, add = TRUE, lwd = .5)
 ```
@@ -704,7 +704,7 @@ plot(occs_mess, col = colours, breaks = breaks)
 
 Bio_15 is basically always positive, so may not have much predictive power. This tracks with it rarely being the most dissimilar variable.
 
-## Spatial thinning
+## Thining observational data
 
 Our observations are biased towards where people look (i.e. along roads) rather than how *Niphophila* are actually distributed. Some observations are also clustered closely together, and if we included all of them certain environments would be overrepresented.
 
@@ -753,12 +753,100 @@ niph_sf |>
 
 If you zoom into the transect boxes layer you can see that they constrain the transect observations correctly. There's one extra observation in one of the boxes, however it's from 2017 and has been excluded correctly.
 
-Now we have to thin out the transect data. I'm going to do this using environmental thinning
+Now we have to thin out the transect data. I'm going to do this using environmental thinning which splits each predictor into bins and then keeps a record whenever the transect reaches a new combination of conditions.
+
+First, let's see how many grid cells there are along our transects.
+
+```{r}
+length(unique(cells(clim_selected[[1]], vect(niph_transects))[, "cell"]))
+```
+
+Okay, so at most we will be keeping 45 transect observations (observations within the same grid cell are the same for our purposes).
+
+Now let's do the environmental thinning.
+
+```{r}
+# Choose the number of bins to group the climate variables. 
+# I tested a few values and the results are stable between 9-12 bins.
+
+n_bins <- 10
+
+# Find the range of each variable across the whole study area
+
+ranges <- global(clim_selected, c("min", "max"), na.rm = TRUE)
+
+# Find the bin edges for each variable
+
+bin_edges <- clim_vars |>
+  set_names() |>
+  map(\(v) seq(ranges[v, "min"], ranges[v, "max"], length.out = n_bins + 1))
+
+# Extract the values of each variable at our transect points
+
+transect_clim <- niph_sf |>
+  filter(transect) |> 
+  bind_cols(terra::extract(clim_selected, vect(niph_transects), ID = FALSE))
+
+# Define a function to assign each value to a bin number
+
+assign_bin <- function(x, edges) {
+  cut(x, breaks = edges, include.lowest = TRUE, labels = FALSE)
+}
+
+# Keep one record per occupied combination of bins
+
+transect_thinned <- transect_clim |>
+  mutate(across(all_of(clim_vars),
+                \(x) assign_bin(x, bin_edges[[cur_column()]]),
+                .names = "{.col}_bin")) |>
+  group_by(across(ends_with("_bin"))) |>
+  slice_sample(n = 1) |>
+  ungroup()
+
+# Update our data set
+
+niph_trans_thinned <- bind_rows(
+  filter(niph_sf, !transect),
+  select(transect_thinned, all_of(names(niph_sf)))
+)
+
+cat(nrow(transect_thinned), "/", nrow(niph_transects), "transect observations kept")
+```
+
+We can also visualise the points which have been retained.
+
+```{r}
+transect_status <- niph_transects |>
+  mutate(status = if_else(recordID %in% transect_thinned$recordID, "kept", "removed"))
+
+mapview(transect_status, zcol = "status", alpha.regions = 1)
+```
 
 ### Spatial thinning
 
-We'll do this by removing records until no two are closer than a chosen distance, e.g. 1 km. The `spThin` package repeats this process many times and selects the output that lets us keep the most data points.
+Next we'll do spatial thinning across the whole data set, including the transects.
 
-I was waiting until I did the variable selection.
+I originally did this using the `spThin` package which basically removes records one by one until no two are closer than a chosen distance, e.g. 1 km. By doing this randomly many times over we can choose the version that allows us to the keep the most data points. However, this process doesn't necessarily guarantee that we'll only have one observation per grid cell.
 
-ROADS
+An alternative method is simpler. Group the observations by grid cell and keep the observation which has the lowest coordinate uncertainty. Recency is used as a tiebreaker.
+
+```{r}
+niph_thinned <- niph_trans_thinned |>
+  mutate(cell = cells(clim[[1]], vect(niph_trans_thinned))[, "cell"]) |>
+  arrange(coordinateUncertaintyInMeters, desc(year)) |>
+  distinct(cell, .keep_all = TRUE)
+
+cat(nrow(niph_thinned), "/", nrow(niph_trans_thinned), "observations kept")
+```
+
+And let's see what we removed.
+
+```{r}
+niph_trans_thinned |> 
+  mutate(kept = recordID %in% niph_thinned$recordID) |> 
+  mapview(zcol = "kept")
+```
+
+The majority of records which were removed are clustered around high-traffic areas like Hotham Heights or Charlotte Pass. This is what we wanted as these areas are overrepresented in our observation data. It should be noted that no environmental data was actually lost in this step - the model would only use one observation per grid cell anyway.
+
+We could consider doing another round of thinning based on the actual distances between obsrvations using `spThin`. This would further reduce the sampling bias, however it would also risk losing environmental data. I'll leave it here for now.
