@@ -28,27 +28,21 @@ That is, we're trying to quantify the decline in the area of *niphophila* habita
 
 This section contains package imports.
 
+Package versions are managed using [renv](https://rstudio.github.io/renv/). The exact versions used in this analysis are recorded in `renv.lock`. To reproduce the analysis, open the project and run `renv::restore()` to install them.
+
 ```{r}
 #| message: false
 #| warning: false
 
 library(dplyr)       # Data wrangling
 library(tidyr)       # Moving data between tall and wide formats
-#library(readr)      # In/out tabular data
 library(purrr)       # Functional programming tools
 library(ggplot2)     # Plotting
 library(sf)          # Vector data tools
 library(terra)       # Raster data tools
 library(mapview)     # Quick interactive maps
 library(galah)       # Access species occurrence data (Atlas of Living Australia)
-#library(geodata)    # Access climate data, including projections
-#library(maxnet)     # Maxent species distribution modeling
-#library(ENMeval)    # Tune ecological niche models
 library(conflicted)  # Manage package conflicts
-
-# Also used via pkg::fun():
-# conflicted, corrplot, geodata, smoothr, spThin, predicts,
-# ggrepel, here, units, readr, usdm
 
 conflicted::conflict_prefer("extract", "terra")
 conflicted::conflict_prefer("filter", "dplyr")
