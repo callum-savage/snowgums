@@ -84,7 +84,7 @@ crs_geog <- 4326 # WGS 84
 crs_proj <- 7855 # GDA2020 / MGA zone 55 (144°E–150°E)
 ```
 
-# Part 1: The present
+# Part 1: Current climate
 
 ## Prepare observational data
 
@@ -877,3 +877,11 @@ niph |>
 The majority of records which were removed are clustered around high-traffic areas like Hotham Heights or Charlotte Pass. This is what we wanted as these areas are overrepresented in our observation data. It should be noted that no environmental data was actually lost in this step - the model would only use one observation per grid cell anyway.
 
 We could consider doing another round of thinning based on the actual distances between observations using `spThin`. This would further reduce the sampling bias, however it would also risk losing environmental data. I'll leave it here for now.
+
+Before we move on to the modelling, it's also interesting to see why points were excluded.
+
+```{r}
+niph |> 
+  st_drop_geometry() |> 
+  count(excluded)
+```

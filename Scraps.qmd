@@ -4,7 +4,171 @@ format: html
 editor: visual
 ---
 
-## 
+## Background points
+
+Thinning partially accounts for bias in our observations, however they're still likely to be clustered around roads and other popular locations. To deal with this, we can create an approximate model of where people observe plants across our study area by looking at observations of all vascular plants.
+
+```{r}
+# Define a simplified polygon to use for requesting plant observations
+
+study_area_query <- study_area |>
+  st_transform(crs_proj) |>
+  st_buffer(2500) |>
+  st_simplify(dTolerance = 2000) |>
+  st_transform(crs_geog)
+
+# Confirm that it covers the whole study area
+
+st_covers(study_area_query, study_area, sparse = FALSE)
+
+# Define a galah query which extracts all plant records in study_area_query.
+# Data quality filters are applied before downloading the data
+
+plantae_raw_call <- galah_call() |>
+  identify("Plantae") |>
+  apply_profile(CSDM) |> 
+  filter(
+    !is.na(decimalLongitude),
+    !is.na(decimalLatitude),
+    year >= 1970,
+    coordinateUncertaintyInMeters <= 1000
+  ) |>
+  geolocate(study_area_query, type = "polygon")
+
+# Download the observations (or import cached copy)
+
+plantae_raw_path <- here::here("data/galah/plantae_raw.rds")
+
+if (file.exists(plantae_raw_path)) {
+  plantae_raw <- readr::read_rds(plantae_raw_path)
+} else {
+  plantae_raw <- atlas_occurrences(plantae_raw_call)
+  readr::write_rds(plantae_raw, plantae_raw_path)
+}
+
+# Clip to the actual study area 
+
+plantae <- plantae_raw |> 
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = crs_geog) |>
+  st_filter(study_area)
+
+cat(nrow(plantae), "plant observations in the study area")
+```
+
+Now we can turn these observations into a bias surface.
+
+```{r}
+# Create a template raster that defines our grid
+
+template_proj <- rast(
+  ext(project(clim[[1]], paste0("EPSG:", crs_proj))),
+  resolution = 1000,
+  crs = paste0("EPSG:", crs_proj)
+)
+
+# Group observtions into 'events'
+
+plantae_proj <- st_transform(plantae, crs_proj)
+
+# Assign each record to a template cell, then keep one row per cell per day
+
+plantae_events <- plantae_proj |> 
+  mutate(
+    cell = cells(template_proj, vect(plantae_proj))[, "cell"],
+    date = as.Date(eventDate)
+  ) |>
+  st_drop_geometry() |>
+  distinct(cell, date, dataResourceName) |>
+  count(cell)
+
+# Write the event counts into a raster
+
+event_counts <- rast(template_proj, vals = 0)
+event_counts[plantae_events$cell] <- plantae_events$n
+
+# Smooth and bring back onto the climate grid as before
+
+bias_sigma <- 2000 # m
+
+bias <- event_counts |>
+  focal(w = focalMat(template_proj, d = bias_sigma, type = "Gauss"), fun = "sum", na.rm = TRUE) |>
+  project(clim[[1]], method = "bilinear") |>
+  mask(clim[[1]])
+
+
+
+
+# # Count target-group records in each climate grid cell
+# 
+# bias_sigma = 0.02 # degrees
+# 
+# plantae_counts <- rasterize(vect(plantae), clim[[1]], fun = "count", background = 0) |>
+#   mask(clim[[1]])
+# 
+# # Smooth the counts with a Gaussian kernel, so cells next to well-surveyed
+# # areas aren't treated as unvisited
+# 
+# kernel <- focalMat(plantae_counts, d = bias_sigma, type = "Gauss")
+# 
+# bias <- plantae_counts |>
+#   focal(w = kernel, fun = "sum", na.rm = TRUE) |>
+#   mask(clim[[1]])
+
+plot(bias, main = "Target-group sampling density")
+points(vect(filter(niph, is.na(excluded))), pch = 20, cex = 0.1, col = "red")
+```
+
+```{r}
+# Sample background points weighted by the bias surface,
+# never asking for more points than there are cells
+
+n_bg <- 10000
+
+n_cells <- global(!is.na(clim[[1]]), "sum")[[1]]
+n_bg <- min(n_bg, n_cells)
+
+bg <- spatSample(bias, size = n_bg, method = "weights", xy = TRUE, values = FALSE, na.rm = TRUE) |>
+  as_tibble()
+
+cat(n_bg, "background points from", n_cells, "cells")
+```
+
+```{r}
+# State boundaries, to compare where background and presences fall
+
+states <- geodata::gadm("AUS", level = 1, path = here::here("data")) |>
+  st_as_sf() |>
+  select(state = NAME_1)
+
+bg_states <- bg |>
+  st_as_sf(coords = c("x", "y"), crs = crs_geog) |>
+  st_join(states) |>
+  st_drop_geometry() |>
+  count(state)
+
+presence_states <- niph |>
+  filter(is.na(excluded)) |>
+  st_drop_geometry() |>
+  count(state = stateProvince)
+
+# Proportion of each set in each state
+
+bind_rows(presences = presence_states, background = bg_states, .id = "set") |>
+  group_by(set) |>
+  mutate(prop = round(n / sum(n), 2)) |>
+  select(-n) |>
+  pivot_wider(names_from = set, values_from = prop)
+```
+
+```{r}
+# Visual check: background (grey) and presences (red) over the bias surface
+
+plot(bias, main = "Background and presence points")
+points(bg$x, bg$y, pch = 20, cex = 0.2, col = "grey30")
+points(vect(filter(niph, is.na(excluded))), pch = 20, cex = 0.5, col = "red")
+```
+
+### WorldClim download
 
 We can download future climate projections from WorldClim's CMIP6 downscaled data. This matches the grid of our baseline climate date.
 
