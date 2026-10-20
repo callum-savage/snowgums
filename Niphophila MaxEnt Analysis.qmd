@@ -15,15 +15,6 @@ The specific criteria being addressed is:
 
 That is, we're trying to quantify the decline in the area of *niphophila* habitat under future climate change projections.
 
-### Some similar analyses
-
-- Ren, Jun, Suhang Li, Yawen Zhang, Qiong Yang, Jiaojiao Liu, Jing Fan, and Yangzhou Xiang. 2025. ‘MaxEnt-Based Evaluation of Climate Change Effects on the Habitat Suitability of Magnolia Officinalis in China’. *Frontiers in Plant Science* 16:1601585. doi:[10.3389/fpls.2025.1601585](https://doi.org/10.3389/fpls.2025.1601585).
-
-### Useful references for MaxEnt modeling:
-
-- Merow, C., Smith, M. J., & Silander, J. A. (2013). A practical guide to MaxEnt for modeling species’ distributions: What it does, and why inputs and settings matter. Ecography, 36(10), 1058–1069. https://doi.org/10.1111/j.1600-0587.2013.07872.x
-- Elith, J., Phillips, S. J., Hastie, T., Dudík, M., Chee, Y. E., & Yates, C. J. (2011). A statistical explanation of MaxEnt for ecologists: Statistical explanation of MaxEnt. Diversity and Distributions, 17(1), 43–57. https://doi.org/10.1111/j.1472-4642.2010.00725.x
-
 # Setup
 
 This section contains package imports.
@@ -59,7 +50,7 @@ galah::galah_config(
   directory = here::here("data/galah")
 )
 
-# Set some default mapview parameters
+# Default mapview parameters
 
 mapview::mapviewOptions(
   basemaps = c("Esri.WorldTopoMap", "Esri.WorldImagery", "Esri.NatGeoWorldMap"),
@@ -68,23 +59,27 @@ mapview::mapviewOptions(
   alpha = 0.2
 )
 
-# Set the default ggplot themeing
+# Default ggplot themeing
 
 ggplot2::theme_set(
   theme_minimal(base_size = 12)
 )
+```
 
-# Choose a random number seed so results are reproducible
+There are also some parameters used throughout the analysis which are defined here for convenience.
+
+```{r}
+# Random number seed so results are reproducible
 
 set.seed(4444)
 
-# Specify the geographic and projected CRSs used throughout this project
+# Geographic and projected CRSs used throughout this project
 
 crs_geog <- 4326 # WGS 84
 crs_proj <- 7855 # GDA2020 / MGA zone 55 (144°E–150°E)
 ```
 
-# Part 1: Current climate
+# Part 1: Data preparation
 
 ## Prepare observational data
 
@@ -92,7 +87,7 @@ crs_proj <- 7855 # GDA2020 / MGA zone 55 (144°E–150°E)
 
 The first thing I'll do is import the *E. niphophila* observational data. I'm using the `galah` package, which lets me access all of the data compiled by the Atlas of Living Australia (ALA). Observations come from a number of sources such as government agencies (mostly DEECCEW), herbaria, and iNaturalist.
 
-I'm going to download just about every column that could possibly be of use, including a bunch of built-in data quality checks which we can use to exclude low quality observations from the training data.
+Before downloading, I'm applying the built in data quality filter for species distribution modelling which accounts for outliers, duplicates, and invalid coordiantes. I'm also only downloading observations which are from Australia and which have lat/lon coordinates.
 
 - [Descriptions of the data quality variables](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki)
 
@@ -101,6 +96,8 @@ I'm going to download just about every column that could possibly be of use, inc
 ```{r}
 # If niph_raw has already been downloaded, import it. Otherwise, download observations from
 # the Atlas of Living Australia, including >100 metadata columns.
+
+# Note that this data will change as new records are uploaded.
 
 niph_raw_path <- here::here("data/galah/niph_raw.rds")
 
@@ -114,6 +111,13 @@ if (file.exists(niph_raw_path)) {
   
   niph_raw_call <- galah_call() |>
     identify("Eucalyptus pauciflora subsp. niphophila") |>
+    apply_profile(CSDM) |> 
+    filter(
+      occurrenceStatus == "PRESENT",
+      !is.na(decimalLongitude),
+      !is.na(decimalLatitude),
+      country == "Australia"
+      ) |>
     select(
       group = c(
         "basic", # record_id, lat/lon, etc.
@@ -135,7 +139,7 @@ if (file.exists(niph_raw_path)) {
   
   # Download our occurrence data
   
-  niph_raw <- atlas_occurrences(niph_raw_call)
+  niph_raw <- atlas_occurrences(niph_raw_call, mint_doi = TRUE)
   
   # Save the raw data as an rds file
   
@@ -145,75 +149,89 @@ if (file.exists(niph_raw_path)) {
 cat("Number of unfiltered Niphophila observations: ", nrow(niph_raw))
 ```
 
-### Filter out low-quality data
+### Exclude low-quality data
 
-Not all of this data is super high quality, so we can apply some data quality filters to try and filter out unreliable records. I'm basing this on the data quality filters ALA suggests for species distribution modelling, along with some additional data quality checks.
+Not all of this data is super high quality, so we can apply some data quality filters to try and filter out unreliable records:
 
-The most important data quality filters are
+- Records from before 1970
 
-- [`spatiallyValid`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/spatiallyValid)`== TRUE`: Built-in checks to make sure the coordinates are valid and logically consistent
-
-- [`is.na(isDuplicateOf)`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/isDuplicateOf): The record hasn't been flagged by ALA as a duplicate
-
-- [`outlierLayerCount`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/outlierLayerCount)`== 0`: The record hasn't been flagged by ALA as an outlier when compared with other environmental data.
-
-- [`coordinateUncertaintyInMeters`](https://github.com/AtlasOfLivingAustralia/ala-dataquality/wiki/coordinate_uncertainty)`<= 1000`: Estimated coordinate uncertainty is less than 1 km. Records with no uncertainty estimate are removed as well.
-
-- I'm also removing records from before 1970 to match the baseline of our climate data, as well as any records which aren't in NSW, ACT, or Victoria.
+- Observations where the coordinate uncertainty is \> 1 km, or missing
 
 ```{r}
+# Define a helper function to flag excluded records
+# NA results to the condition are also flagged
+
+flag <- function(df, condition, reason) {
+  df |>
+    mutate(
+      exclusion_reason = coalesce(
+        exclusion_reason, 
+        if_else({{ condition }}, reason, NA, missing = reason)
+      ),
+      excluded = !is.na(exclusion_reason)
+    )
+}
+
+#alps_states <- c("Victoria", "Australian Capital Territory", "New South Wales")
+
 niph <- niph_raw |> 
   
-  # Apply data quality checks
+  # Create an empty column to keep track of exclusions
   
-  filter(
-    occurrenceStatus == "PRESENT", # Not actually necessary, but reassuring
-    !is.na(decimalLongitude), 
-    !is.na(decimalLatitude),
-    coordinateUncertaintyInMeters <= 1000,
-    spatiallyValid == TRUE,
-    is.na(isDuplicateOf),
-    outlierLayerCount == 0,
-    year >= 1970,
-    country == "Australia",
-    stateProvince %in% c("Victoria", "Australian Capital Territory", "New South Wales")
-  ) |> 
+  mutate(excluded = FALSE, exclusion_reason = NA_character_) |> 
   
-  # Column selection
+  # Exclude and flag low-quality data
+  
+  #flag(occurrenceStatus != "PRESENT", "not present") |> 
+  #flag(is.na(decimalLongitude) | is.na(decimalLatitude), "missing coordinates") |> 
+  #flag(spatiallyValid == FALSE, "not spatially valid (ALA)") |> 
+  #flag(!is.na(isDuplicateOf), "duplicate record (ALA)") |> 
+  #flag(outlierLayerCount != 0, "outlier (ALA)") |> 
+  #flag(country != "Australia", "not in Australia") |> 
+  #flag(!(stateProvince %in% alps_states), "not in Alps states") |> 
+  flag(is.na(year), "year missing") |> 
+  flag(year < 1970, "pre-1970") |> 
+  flag(is.na(coordinateUncertaintyInMeters), "coordinate uncertainty missing") |> 
+  flag(coordinateUncertaintyInMeters > 1000, "coordinate uncertainty > 1 km") |> 
+  
+  # Select a more usable subset of columns
   
   select(
-    "recordID",
-    "scientificName",
-    "decimalLongitude",
-    "decimalLatitude",
-    "coordinateUncertaintyInMeters",
-    "eventDate",
-    "year",
-    "basisOfRecord",
-    "identifiedBy",
-    "locality",
-    "stateProvince",
-    "dataResourceName",
-    "institutionCode"
+    recordID,
+    scientificName,
+    decimalLongitude,
+    decimalLatitude,
+    coordinateUncertaintyInMeters,
+    eventDate,
+    year,
+    basisOfRecord,
+    identifiedBy,
+    locality,
+    stateProvince,
+    dataResourceName,
+    institutionCode, 
+    excluded, 
+    exclusion_reason
   ) |> 
   
   # Convert to a simple features object, i.e. explicitly spatial
   
-  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = crs_geog) |> 
-  
-  # Creaet an empty column to keep track of exclusions
-  
-  mutate(excluded = NA_character_)
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = crs_geog)
 
-# Define a helper function for flaging excluded records
+# Tabulate the reasons for record removal
 
-flag <- function(excluded, condition, reason) {
-  coalesce(excluded, if_else(condition, reason, NA))
-}
+niph |> 
+  st_drop_geometry() |> 
+  count(exclusion_reason) |> 
+  print()
+```
 
+We can view the observations we have left interactively.
+
+```{r}
 # View the records in an interactive map
 
-mapview(niph)
+mapview(niph |> filter(!excluded))
 ```
 
 ### Targeted outlier removal
@@ -227,7 +245,7 @@ Some observations are still suspicious, despite passing the data quality checks.
 ```{r}
 # Identify suspicous records
 
-suspicious <- c(
+targeted_exclusion <- c(
     "2c4dd780-74ef-4337-893b-250e47aa64a8" = "In Grampians NP, outside known range",
     "f1047be9-66f7-4ba6-9157-d0f1d906fa12" = "In Baw Baw, likely different subspecies",
     "56c4cb9d-db98-4f0c-8080-d75a281a5b06" = "In Baw Baw, likely different subspecies"
@@ -237,18 +255,17 @@ suspicious <- c(
 # Flag these observations for exclusion
 
 niph <- niph |> 
-  mutate(
-    excluded = flag(excluded, recordID %in% suspicious$recordID, "suspicious")
-  )
+  flag(recordID %in% targeted_exclusion$recordID, "targeted exclusion")
 
 niph |> 
-  mutate(suspicious = excluded %in% "suspicious") |>
-  mapview(zcol = "suspicious")
+  mutate(targeted_exclusion = exclusion_reason %in% "targeted exclusion") |> 
+  filter(!excluded | targeted_exclusion) |> 
+  mapview(zcol = "targeted_exclusion")
 ```
 
 ### Check the elevations
 
-*E. niphophila* is known to inhabit altitudes above 1600 m (expert advice). To allow for some natural variation we'll allow records down to 1400 m, but any records below this altitude will be removed as they have a higher likelihood of being mis-identifications.
+*E. niphophila* is known to inhabit altitudes above 1600 m (expert advice). To allow for some natural variation we'll allow records down to 1400 m, but any records below this altitude will be removed as they have a higher likelihood of being misidentifications.
 
 ```{r}
 # Download a 5 degree tile of 3s elevation data which covers the observations.
@@ -264,7 +281,7 @@ niph_elevs <- extract(elev_3s, vect(niph))
 
 niph_buffers <- buffer(
   vect(niph), 
-  width = niph$coordinateUncertaintyInMeters
+  width = coalesce(niph$coordinateUncertaintyInMeters, 1)
 )
 
 # Extract the maximum and minimum elevations in each buffer zone
@@ -277,20 +294,22 @@ niph_elev_max <- extract(elev_3s, niph_buffers, fun = max, na.rm = TRUE)
 niph <- niph |>
   mutate(
     elevation_m = niph_elevs[[2]],
-    elevation_m_min = niph_elev_min[[2]],
-    elevation_m_max =niph_elev_max[[2]],
+    elevation_m_min = if_else(is.na(coordinateUncertaintyInMeters), NA, niph_elev_min[[2]]),
+    elevation_m_max = if_else(is.na(coordinateUncertaintyInMeters), NA, niph_elev_max[[2]]),
     .after = coordinateUncertaintyInMeters
   )
 
 # Flag records below the elevation threshold
 
 niph <- niph |>
-  mutate(excluded = flag(excluded, elevation_m < 1400, "below elevation"))
+  flag(is.na(elevation_m), "elevation missing") |> 
+  flag(elevation_m < 1400, "below elevation")
 
 # Have a look at the observations we just filtered out
 
 niph |> 
-  mutate(below_elevation = excluded %in% "below elevation") |> 
+  mutate(below_elevation = exclusion_reason %in% "below elevation") |> 
+  filter(!excluded | below_elevation) |> 
   mapview(zcol = "below_elevation", alpha.regions = 0.8)
 ```
 
@@ -314,7 +333,7 @@ aus_alps <- st_read(here::here("data/IBRA7_regions.gdb")) |>
 # Identify any observations outside the bioregion
 
 niph_outside_aus_alps <- niph |> 
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   st_filter(aus_alps, .predicate = st_disjoint)
 
 # Plot just the points outside the bioregion
@@ -344,7 +363,7 @@ Okay, so they're all within 100 m of the bioregion, which is within the bounds o
 
 ```{r}
 niph |> 
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   ggplot(aes(x = year)) +
   geom_bar() +
   labs(x = "Year", y = "Records", title = "Observations by year")
@@ -354,7 +373,7 @@ It looks like there was a spike in observations in 1999 - I assume this is due t
 
 ```{r}
 niph |> 
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   filter(year == 1999) |> 
   mapview()
 ```
@@ -363,7 +382,7 @@ Yeah, so 1999 is the year of those transects. It is possible that those records 
 
 ```{r}
 niph |>
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   ggplot(aes(forcats::fct_infreq(basisOfRecord))) +
   geom_bar() +
   geom_text(aes(label = after_stat(count)), stat = "count", hjust = -0.2) +
@@ -376,7 +395,7 @@ Most of our observations are human observations which is great. The single recor
 
 ```{r}
 niph |>
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   ggplot(aes(elevation_m)) +
   geom_histogram(binwidth = 25, boundary = 1400) +
   geom_vline(xintercept = 1400, linetype = "dashed") +
@@ -387,7 +406,7 @@ This looks roughly like what we'd expect. Most observations are below 1800, thou
 
 ```{r}
 niph |>
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   ggplot(aes(coordinateUncertaintyInMeters)) +
   geom_histogram(binwidth = 50, boundary = 0) +
   geom_vline(xintercept = 1000, linetype = "dashed") +
@@ -398,7 +417,7 @@ Interesting, it looks like the majority of our records are actually more accurat
 
 ```{r}
 niph |> 
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   st_drop_geometry() |> 
   count(stateProvince)
 ```
@@ -407,7 +426,7 @@ NSW seems to quite heavily weighted in our data. I think that's primarily becaus
 
 ```{r}
 niph |> 
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   st_drop_geometry() |> 
   count(dataResourceName) |> 
   arrange(-n)
@@ -417,7 +436,7 @@ NSW BioNet Atlas being the largest data source tracks with the high occurrence o
 
 ```{r}
 niph |> 
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   st_drop_geometry() |> 
   count(institutionCode) |> 
   arrange(-n)
@@ -427,7 +446,7 @@ DCCEEW and iNaturalist together provide most of our data.
 
 ```{r}
 niph |> 
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   st_drop_geometry() |> 
   count(identifiedBy) |> 
   arrange(-n)
@@ -445,7 +464,7 @@ I'll be basing the study area on the Australian Alps bioregion. All of our obser
 # To look at distances between points we need to move to a projected CRS
 
 niph_proj <- niph |>
-  filter(is.na(excluded)) |>
+  filter(!excluded) |> 
   st_transform(crs_proj)
 
 # Keep polygons within 1000 m of an observation
@@ -478,7 +497,7 @@ study_area <- aus_alps_parts |>
   st_make_valid()
 
 mapview(study_area, alpha.regions = 0.3, lwd = 2, alpha = 1) +
-  mapview(filter(niph, is.na(excluded)), col.regions = "red")
+  mapview(filter(niph, !excluded), col.regions = "red")
 ```
 
 There are still parts of the study area which don't have any observations. Possibly these should be removed. Alternatively, multiple different study areas can be tested to see if it effects the output.
@@ -487,7 +506,7 @@ There are still parts of the study area which don't have any observations. Possi
 # Double check that all observations are within the study area (expect 0 rows)
 
 niph |> 
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   st_filter(study_area, .predicate = st_disjoint) |> 
   nrow()
 ```
@@ -529,7 +548,7 @@ clim_tile <- geodata::worldclim_tile(
 # Crop the climate data to our study area, making sure that any grid cell 
 # that touches the study area is included
 
-clim <- clim_tile |>
+clim_all <- clim_tile |>
   crop(vect(study_area), snap = "out") |>
   mask(vect(study_area), touches = TRUE)
 
@@ -561,7 +580,7 @@ bio_names <- c(
 
 plot_vars <- c("bio_1", "bio_2", "bio_5", "bio_6", "bio_7", "bio_12")
 
-plot(clim[[plot_vars]], main = bio_names[plot_vars])
+plot(clim_all[[plot_vars]], main = bio_names[plot_vars])
 ```
 
 ### Predictor selection
@@ -571,7 +590,7 @@ Many of these environmental variables are highly co-linear (they are all derived
 We can see this if we create a correlation plot.
 
 ```{r}
-clim_corr <- layerCor(clim, "pearson", na.rm = TRUE)$correlation
+clim_corr <- layerCor(clim_all, "pearson", na.rm = TRUE)$correlation
 
 corrplot::corrplot(
   clim_corr,
@@ -600,7 +619,7 @@ In practice this is implemented by `usdm::vifstep`.
 
 interactive_vars <- c("bio_8", "bio_9", "bio_18", "bio_19")
 
-clim_candidates <- clim[[setdiff(names(clim), interactive_vars)]]
+clim_candidates <- clim_all[[setdiff(names(clim_all), interactive_vars)]]
 
 # Then do the VIF analysis
 
@@ -624,11 +643,11 @@ vif_exclusions2
 In this set bio_6 (minimum temperature of the coldest month) has been exchanged for bio_1 (annual mean temperature). The maximum correlation between any two variables has also been reduced, though at -0.72 it's still quite high.
 
 ```{r}
-clim_selected <- usdm::exclude(clim_candidates, vif_exclusions2)
+clim <- usdm::exclude(clim_candidates, vif_exclusions2)
 
-clim_vars <- names(clim_selected)
+clim_vars <- names(clim)
 
-plot(clim_selected, main = bio_names[names(clim_selected)])
+plot(clim, main = bio_names[clim_vars])
 ```
 
 ### Environmental similarity analysis
@@ -642,7 +661,7 @@ mess_area <- crop(clim_tile[[clim_vars]], ext(145.5, 152, -38, -35))
 
 # Extract the climatic variables at each observation
 
-occs_z <- extract(mess_area, vect(filter(niph, is.na(excluded))), ID = FALSE) |>
+occs_z <- extract(mess_area, vect(filter(niph, !excluded)), ID = FALSE) |>
   drop_na()
 
 # Get the MESS values across the full tile (not just the study area)
@@ -743,7 +762,7 @@ transect_boxes <- transect_box_coords |>
 # Identify the transect records
 
 niph_transects <- niph |> 
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   filter(year == 1999, stateProvince == "New South Wales") |> 
   st_filter(transect_boxes) |> 
   pull(recordID)
@@ -767,7 +786,7 @@ Now we have to thin out the transect data. I'm going to do this using environmen
 First, let's see how many grid cells there are along our transects.
 
 ```{r}
-length(unique(cells(clim_selected[[1]], vect(filter(niph, transect)))[, "cell"]))
+length(unique(cells(clim[[1]], vect(filter(niph, transect)))[, "cell"]))
 ```
 
 Okay, so at most we will be keeping 45 transect observations (observations within the same grid cell are the same for our purposes).
@@ -782,7 +801,7 @@ n_bins <- 10
 
 # Find the range of each variable across the whole study area
 
-ranges <- global(clim_selected, c("min", "max"), na.rm = TRUE)
+ranges <- global(clim, c("min", "max"), na.rm = TRUE)
 
 # Find the bin edges for each variable
 
@@ -793,11 +812,11 @@ bin_edges <- clim_vars |>
 # Extract the values of each variable at our transect points
 
 transect_clim <- niph |>
-  filter(is.na(excluded)) |> 
+  filter(!excluded) |> 
   filter(transect)
 
 transect_clim <- transect_clim |> 
-  bind_cols(terra::extract(clim_selected, vect(transect_clim), ID = FALSE))
+  bind_cols(terra::extract(clim, vect(transect_clim), ID = FALSE))
 
 # Define a function to assign each value to a bin number
 
@@ -819,12 +838,8 @@ niph_transect_thinned <- transect_clim |>
 # Flag the thinned out records
 
 niph <- niph |> 
-  mutate(excluded = flag(
-      excluded, 
-      transect & !(recordID %in% niph_transect_thinned), 
-      "transect thinning"
-    ))
-
+  flag(transect & !(recordID %in% niph_transect_thinned), "transect thinning")
+ 
 cat(length(niph_transect_thinned), "/", length(niph_transects), "transect observations kept")
 ```
 
@@ -853,7 +868,7 @@ niph$cell <- cells(clim[[1]], vect(niph))[, "cell"]
 # Keep the most precise (then most recent) record in each cell
 
 kept <- niph |>
-  filter(is.na(excluded)) |>
+  filter(!excluded) |>
   arrange(coordinateUncertaintyInMeters, desc(year)) |>
   distinct(cell, .keep_all = TRUE) |>
   pull(recordID)
@@ -861,7 +876,7 @@ kept <- niph |>
 # Flag the excluded records
 
 niph <- niph |>
-  mutate(excluded = flag(excluded, !recordID %in% kept, "grid cell thinning"))
+  flag(!recordID %in% kept, "grid cell thinning")
 
 cat(length(kept), "observations kept")
 ```
@@ -870,7 +885,8 @@ And let's see what we removed.
 
 ```{r}
 niph |> 
-  mutate(removed = excluded %in% "grid cell thinning") |> 
+  mutate(removed = exclusion_reason %in% "grid cell thinning") |> 
+  filter(!excluded | removed) |> 
   mapview(zcol = "removed")
 ```
 
@@ -883,5 +899,181 @@ Before we move on to the modelling, it's also interesting to see why points were
 ```{r}
 niph |> 
   st_drop_geometry() |> 
-  count(excluded)
+  count(exclusion_reason) |> 
+  print()
 ```
+
+# Part 2: Model fitting
+
+## Training and testing data
+
+### Background
+
+```{r}
+# Extract the bare occurence data (just x/y coordinates of included obsrvations)
+
+occs <- niph |>
+  filter(!excluded) |>
+  st_coordinates() |>
+  as.data.frame() |>
+  setNames(c("x", "y"))
+
+# Define a set of unifrom background points, which is just the centre of each cell
+
+bg_uniform <- as.data.frame(clim[[1]], xy = TRUE, na.rm = TRUE)[, c("x", "y")]
+
+cat(nrow(occs), "presences,", nrow(bg_uniform), "background points")
+```
+
+### Partitions
+
+We have to partition our observations into training and testing data. This can't just be done randomly because of the spatial correlation in the environment — if the model is tested at grid cell right next to where it was trained then it's going to be able to predict habitat suitability by interpolating between training points rather than by actually describing the habitat accurately.
+
+I'm partitioning the data into 4 folds. Each of these will be excluded one at a time and used to test a model based on data from the other three folds. There's a few ways we can do this, but the most straightforward are the block and checkerboard methods. I'm going to construct a few different partition sets using different parameters and see how they compare.
+
+```{r}
+# Block: This splits at the medians of latitude and longitude
+# This is a baseline test, it's unlikely to be reliable given the shape of our study area
+
+block <- list("Block" = ENMeval::get.block(occs, bg_uniform))
+
+# Checkerboard: a checkerboard with each square then broken up into another checkerboard
+# It makes sense if you see it.
+
+# Vary the number of cells icluded in the smallest layer of the checkerboard
+
+cb_factors <- c(5, 10, 15, 20, 25) # e.g. 5 x 5 cells, etc.
+cb_factors <- set_names(cb_factors, paste0("Checkerboard (", cb_factors, ", 2)"))
+
+# Create checkerboard partitions for each factor
+
+get_checkerboard <- function(aggregation_factor) {
+  ENMeval::get.checkerboard(
+    occs = occs, 
+    envs = clim, 
+    bg = bg_uniform, 
+    aggregation.factor = c(aggregation_factor, 2)
+  )
+}
+
+# Combine the block and checkerboard partitions into a single list
+
+partitions <- c(
+  block,
+  map(cb_factors, get_checkerboard)
+)
+
+# Map the partitions onto their corresponding background tiles
+
+partition_tiles <- partitions |>
+  imap(\(folds, name) mutate(bg_uniform, fold = factor(folds$bg.grp), method = name)) |>
+  list_rbind() |>
+  mutate(method = forcats::fct_inorder(method))
+
+# Plot each of the partition options
+
+ggplot(partition_tiles, aes(x, y, fill = fold)) +
+  geom_tile() +
+  facet_wrap(~ method, ncol = 3) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(fill = "Fold") +
+  theme_void() +
+  theme(legend.position = "right")
+```
+
+From visual comparison, it's pretty clear that the block partitioning won't be suitable - there will be large biases towards whichever partitions end up containing the hotspots around the various ski towns.
+
+The checkerboard partitions are more difficult to choose between. Generally larger spatial blocks are going to be better because each fold ends up being more independent. On the other hand, if we go too big, then the folds are no longer representative of the environment. It's also important that each fold contains similar numbers of background and occurrence points.
+
+Let's start by looking at how the points are distributed between the folds.
+
+```{r}
+# Extract the number of occurrences and background points in each fold
+
+fold_sizes <- function(folds, name) {
+  full_join(
+    count(tibble(fold = folds$occs.grp), fold, name = "presences"),
+    count(tibble(fold = folds$bg.grp), fold, name = "background"),
+    by = "fold"
+  )
+}
+
+fold_table <- imap(partitions, fold_sizes) |> 
+  list_rbind(names_to = "method")
+
+# Plot the proportion of points in each fold
+
+fold_table |>
+  pivot_longer(c(presences, background), names_to = "type", values_to = "n") |>
+  group_by(method, type) |>
+  mutate(prop = n / sum(n)) |>
+  ungroup() |>
+  mutate(method = forcats::fct_inorder(method)) |>
+  ggplot(aes(method, prop, colour = type)) +
+  geom_hline(yintercept = 0.25, linetype = "dashed") +
+  geom_point(position = position_dodge(width = 0.4), size = 2.5, shape = 1) +
+  coord_flip() +
+  labs(x = NULL, 
+       y = "Proportion of points in fold", 
+       colour = NULL,
+       title = "Fold balance by partition method"
+      )
+```
+
+- A perfectly balanced partition would have all eight dots on the dashed line at 25%.
+
+- The block partition splits the occurrences perfectly, however one partition contains significantly less background
+
+- The background points are generally well balanced for all of the checkerboards, with smaller boxes generally having a more even distribution
+
+- Occurrence points are less evenly distributed in the checkerboard, with some randomness depending on e.g. which fold ends up with the points around Kosciuszko. (10, 2) is least balanced, though the other options all perform similarly. (25, 2) is the most balanced.
+
+The other criteria we have to consider is the environmental similarity of each fold. We can do this by calculating the environmental similarity of each fold to its three training folds (thankfully there are package functions to do this for me). Areas with negative values represent conditions unrepresented in the test fold.
+
+```{r}
+# Calculate the environmental similarity of each test fold to its training folds.
+
+# Reformat climate variables at occurrence and background for ENMeval
+
+occs_z <- occs |> 
+  bind_cols(extract(clim, as.matrix(occs))) |> 
+  rename(longitude = x, latitude = y)
+
+bg_z <- bg_uniform |> 
+  bind_cols(extract(clim, as.matrix(bg_uniform))) |> 
+  rename(longitude = x, latitude = y)
+
+# Calculate the environmental similarity for each grid cell
+
+envsim_tbl <- imap(partitions, \(folds, name) {
+  ENMeval::evalplot.envSim.hist(
+    occs.z = occs_z,
+    bg.z = bg_z,
+    occs.grp = folds$occs.grp,
+    bg.grp = folds$bg.grp,
+    ref.data = "bg",
+    return.tbl = TRUE
+  )
+}) |>
+  list_rbind(names_to = "method")
+
+# Plot the proportion of negative MESS scores for each fold
+
+envsim_tbl |> 
+  filter(method != "Block") |> 
+  mutate(method = forcats::fct_inorder(method)) |>
+  group_by(method, partition) |> 
+  summarise(prop_dissimilar = mean(mess < 0), .groups = "drop") |> 
+  ggplot(aes(method, prop_dissimilar, colour = partition)) +
+  #geom_hline(yintercept = 0.25, linetype = "dashed") +
+  geom_point(position = position_dodge(width = 0.4), size = 2.5) +
+  coord_flip() +
+  labs(x = NULL, y = "Proportion of points with MESS < 0", colour = "Partition",
+       title = "Environmental similarity by partition method")
+```
+
+- Block values were excluded from this plot as they perform so much worse they're off the chart.
+
+- The proportion of test points outside the training environment increases with square size, up to a maximum of around 10% for one of the (25, 2) folds.
+
+With these findings in mind, I think checkerboard (20, 2) strikes the best balance between environmental similarity and balancing the pionts between folds. I'll also do a sensitivity analysis using (15, 2) and (25, 2) to see if our results change much - ideally the choice of partitioning method shouldn't matter much.
