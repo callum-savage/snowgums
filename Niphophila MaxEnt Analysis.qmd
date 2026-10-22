@@ -909,21 +909,214 @@ niph |>
 
 ### Background
 
+Thinning partially accounts for bias in our observations, however they're still likely to be clustered around roads and other popular locations.
+
+To the MaxEnt model, *presences* = *where the species lives* x *where people look*. If we sample the study area uniformly the model assumes that the presences just represent the habitat generally, and the output will show that the ideal habitat is most similar to the most sampled areas, i.e. around Kosciuszko.
+
+To deal with this, we can create an approximate model of where people observe plants across our study area by looking at observation 'events' of all vascular plants. An event here is a unique combination of date and data resource in a specific grid cell.
+
 ```{r}
-# Extract the bare occurence data (just x/y coordinates of included obsrvations)
+# Define a simplified polygon to use for requesting plant observations.
+# The study area is buffered to ensure that areas are not cut-off by the simplification.
 
-occs <- niph |>
-  filter(!excluded) |>
-  st_coordinates() |>
-  as.data.frame() |>
-  setNames(c("x", "y"))
+study_area_query <- study_area |>
+  st_transform(crs_proj) |>
+  st_buffer(5000) |>
+  st_simplify(dTolerance = 2000) |>
+  st_transform(crs_geog)
 
-# Define a set of unifrom background points, which is just the centre of each cell
+# Download the observations (or import cached copy)
 
-bg_uniform <- as.data.frame(clim[[1]], xy = TRUE, na.rm = TRUE)[, c("x", "y")]
+plantae_raw_path <- here::here("data/galah/plantae_raw.rds")
 
-cat(nrow(occs), "presences,", nrow(bg_uniform), "background points")
+if (file.exists(plantae_raw_path)) {
+  
+  plantae_raw <- readr::read_rds(plantae_raw_path)
+  
+} else {
+  
+  # Define a galah query which extracts all plant records in study_area_query.
+  # Data quality filters are applied before downloading the data
+
+  plantae_raw_call <- galah_call() |>
+    identify("Plantae") |>
+    apply_profile(CSDM) |> 
+    filter(
+      !is.na(decimalLongitude),
+      !is.na(decimalLatitude),
+      year >= 1970,
+      coordinateUncertaintyInMeters <= 1000
+    ) |>
+    geolocate(study_area_query, type = "polygon")
+  
+  plantae_raw <- atlas_occurrences(plantae_raw_call, mint_doi = TRUE)
+  readr::write_rds(plantae_raw, plantae_raw_path)
+}
+
+# Convert to a spatial object and reproject onto a projected crs
+
+plantae <- plantae_raw |> 
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = crs_geog) |>
+  st_filter(study_area_query) |> 
+  st_transform(crs_proj)
+
+# Create a template raster that defines our grid
+
+template_proj <- rast(
+  ext(vect(st_transform(study_area_query, crs_proj))),
+  resolution = 1000,
+  crs = paste0("EPSG:", crs_proj)
+)
+
+# Match each record to its template grid cell, then count the number of 'events' per cell.
+# An 'event' is a unique combination of observation date and data resource name. 
+# This deals with the situation where e.g. one person makes 100 observations in the same 
+# area on a single day.
+
+plantae_events <- plantae |> 
+  mutate(
+    cell = cells(template_proj, vect(plantae))[, "cell"],
+    date = as.Date(eventDate)
+  ) |>
+  st_drop_geometry() |>
+  filter(!is.na(date)) |> 
+  distinct(cell, date, dataResourceName) |>
+  count(cell)
+
+# Write the event counts into a raster
+
+event_counts <- rast(template_proj, vals = 0)
+event_counts[plantae_events$cell] <- plantae_events$n
+
+# Define a matrix of smoothing weights (like a 2D bell curve) extending 3 x sigma from the
+# centre cell
+
+bias_sigma <- 2000 # i.e. 2 cells
+bg_kernel <- focalMat(template_proj, d = bias_sigma, type = "Gauss")
+
+# Smooth plant observation surface usng the kerneal and map it back onto the climate grid
+
+bias <- event_counts |>
+  focal(w = bg_kernel, fun = "sum", na.rm = TRUE) |>
+  project(clim[[1]], method = "bilinear") |>
+  mask(clim[[1]])
+
+# Define maximum and minimum values for the bias surface
+
+bias_ceiling <- 100
+bias_floor <- 1
+
+# Normalise the bias surface so the maximum value is set by bias_ceiling
+
+bias <- bias_ceiling * bias / global(bias, "max", na.rm = TRUE)[[1]]
+
+# Also set a minimum value for areas with low bias values to ensure they are stills sampled
+
+bias <- clamp(bias, lower = bias_floor, values = TRUE)
+
+plot(bias, main = "Sampling effort")
 ```
+
+It's a bit easier to see the details of this surface on a log scale. We can also adjust the raw values so that they're relative to the median sampling effort.
+
+```{r}
+bias_rel <- bias / global(bias, median, na.rm = TRUE)[[1]]
+
+plot(log10(bias_rel),
+     main = "Relative sampling effort (log10)",
+     plg = list(
+       at = log10(c(0.5, 1, 3, 10, 30)),
+       labels = c("0.5×", "1×", "3×", "10×", "30×")
+     ))
+```
+
+And again, but this time with the *E. niphophila* observations on top.
+
+```{r}
+plot(log10(bias_rel),
+     main = "Relative sampling effort (log10)",
+     plg = list(
+       at = log10(c(0.5, 1, 3, 10, 30)),
+       labels = c("0.5×", "1×", "3×", "10×", "30×")
+     ))
+points(vect(filter(niph, !excluded)), cex = 0.2, col = "red")
+```
+
+Okay, so we can see that a lot of our observations are clustered around the ski-resort hotspots. It's good to see that there are some highly visited areas with no observations and some observations in areas with few visitors. There is a danger of overcompensating here (as the areas around the ski resorts are the kind of habitat where we'd expect to see a lot of *niphophila*) however without an additional data source (e.g. satellite data) I think this is as good as I can do.
+
+Now let's sample from this background. I'm a bit concerned this bias is overweighted, so I'm going to sample it based on an exponent, `bias^k`.
+
+- If k = 0 it's a uniform background (no bias)
+
+- If k = 1 it's the full background bias
+
+- If k = 0.5 it's the square root of the bias surface, so a gentler bias correction
+
+- And so on for intermediate values
+
+```{r}
+# Number of background points
+
+n_bg <- 5000
+
+# Define a function to scale the bias surface by an exponential factor, k
+
+bias_k <- function(k) {
+  bias_scaled <- bias_ceiling * (bias / global(bias, "max", na.rm = TRUE)[[1]])^k
+  mask(bias_scaled, bias)
+}
+
+# We also need a function to sample points from the background for a given k value
+
+bg_sample_k <- function(k, n_bg) {
+  spatSample(
+    bias_k(k), 
+    size = n_bg,
+    method = "weights", 
+    xy = TRUE, 
+    values = FALSE, 
+    na.rm = TRUE
+  ) |>
+    as_tibble()
+}
+
+# Sample background points for different k values, weighted by the bias surface
+
+k_vals <- c(0, 0.5, 1)
+
+bg_samples <- k_vals |> 
+  set_names(\(k) paste0("k_", k)) |> 
+  map(\(k) bg_sample_k(k, n_bg))
+
+# Plot each background sample for comparison
+
+bg_samples |> 
+  list_rbind(names_to = "sample") |> 
+  mutate(sample = forcats::fct_inorder(sample)) |>
+  ggplot() +
+  geom_sf(data = study_area) +
+  geom_point(aes(x, y), size = 0.1, alpha = 0.3, colour = "darkgreen") +
+  facet_wrap(~ sample) +
+  theme_void()
+```
+
+Let's also check that these most biased background points still describe the full environmental range in the study area.
+
+```{r}
+# Extract the climate values at each background points
+
+bg_bias_z <- extract(clim, as.matrix(bg_samples$k_1))
+
+# Calculate the MESS of the study area compared to the background reference
+
+bg_mess <- predicts::mess(clim, bg_bias_z)
+
+# Plat areas with MESS < 0
+
+plot(bg_mess < 0, main = "Outside background environmental range")
+```
+
+Yay, basically the whole study area is similar to the background points.
 
 ### Partitions
 
@@ -1077,3 +1270,103 @@ envsim_tbl |>
 - The proportion of test points outside the training environment increases with square size, up to a maximum of around 10% for one of the (25, 2) folds.
 
 With these findings in mind, I think checkerboard (20, 2) strikes the best balance between environmental similarity and balancing the pionts between folds. I'll also do a sensitivity analysis using (15, 2) and (25, 2) to see if our results change much - ideally the choice of partitioning method shouldn't matter much.
+
+## Fit
+
+```{r}
+folds <- partitions[["Checkerboard (20, 2)"]]
+
+enm <- ENMeval::ENMevaluate(
+  occs = occs,
+  envs = clim,
+  bg = bg_uniform,
+  algorithm = "maxnet",
+  partitions = "user",
+  user.grp = folds,
+  tune.args = list(
+    fc = c("L", "LQ", "LQH", "H"),
+    rm = seq(0.5, 4, by = 0.5)
+  ),
+  parallel = FALSE
+)
+```
+
+```{r}
+results <- ENMeval::eval.results(enm)
+
+ENMeval::evalplot.stats(
+  enm,
+  stats = c("or.10p", "auc.val"),
+  x.var = "rm",
+  color = "fc"
+)
+```
+
+```{r}
+best_cv <- results |>
+  filter(or.10p.avg == min(or.10p.avg)) |>
+  filter(auc.val.avg == max(auc.val.avg))
+
+best_aicc <- results |>
+  filter(delta.AICc == 0)
+
+bind_rows(cv = best_cv, aicc = best_aicc, .id = "criterion") |>
+  select(criterion, tune.args, auc.val.avg, or.10p.avg, delta.AICc, ncoef)
+```
+
+```{r}
+best_args <- as.character(best_cv$tune.args)
+
+best_model <- ENMeval::eval.models(enm)[[best_args]]
+
+plot(best_model, type = "cloglog")    # response curves
+current_pred <- ENMeval::eval.predictions(enm)[[best_args]]
+
+plot(current_pred, main = "Current habitat suitability")
+```
+
+```{r}
+plot(current_pred)
+points(vect(filter(niph, !excluded)), pch = 20, cex = 0.4, col = "red")
+```
+
+```{r}
+mapview(current_pred)
+
+
+
+```
+
+```{r}
+niph_kept <- filter(niph, !excluded)
+niph_kept$suitability <- extract(current_pred, vect(niph_kept), ID = FALSE)[[1]]
+
+
+niph_kept |>
+  st_drop_geometry() |>
+  group_by(stateProvince) |>
+  summarise(median_suitability = median(suitability), n = n()) |> 
+  print()
+```
+
+```{r}
+range_polys <- niph_kept |>
+  st_transform(crs_proj) |>
+  st_buffer(5000) |>
+  st_union() |>
+  st_cast("POLYGON")
+
+niph_kept$range_id <- st_intersects(st_transform(niph_kept, crs_proj), range_polys) |>
+  map_int(\(x) x[1])
+
+niph_kept |>
+  st_drop_geometry() |>
+  group_by(range_id) |>
+  summarise(median_suitability = median(suitability), n = n()) |>
+  arrange(median_suitability) |> 
+  print()
+```
+
+```{r}
+mapview(niph_kept, zcol = "range_id")
+```
